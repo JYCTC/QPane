@@ -1,0 +1,153 @@
+#    QPane - High-performance PySide6 image viewer
+#    Copyright (C) 2025  Artificial Sweetener and contributors
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Lightweight tests for cache consumer trimming and sanitization helpers."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from qpane.cache.consumers import (
+    MaskOverlayCacheConsumer,
+    SamPredictorCacheConsumer,
+    _run_cache_batch_trim,
+    _safe_int,
+)
+from qpane.cache.coordinator import CacheCoordinator
+
+
+class _CoordinatorStub(CacheCoordinator):
+    """Coordinator subclass exposing update usage for testing."""
+
+
+def test_run_cache_batch_trim_raises_when_hook_missing() -> None:
+    """Missing batch hooks should surface a deterministic error."""
+    with pytest.raises(RuntimeError, match="Missing cache trim hook"):
+        _run_cache_batch_trim(
+            consumer_id="tiles",
+            get_usage=lambda: 10,
+            batch=None,
+            target=0,
+            marker=None,
+            missing_hook_label="tiles batch",
+            warn_message="warn %s",
+        )
+
+
+def test_run_cache_batch_trim_caps_attempts(caplog) -> None:
+    """Trims that never reduce usage should log after max attempts."""
+    attempts: list[int] = []
+
+    def _batch() -> None:
+        attempts.append(1)
+
+    caplog.set_level("WARNING")
+    usage = _run_cache_batch_trim(
+        consumer_id="tiles",
+        get_usage=lambda: 10,
+        batch=_batch,
+        target=0,
+        marker=None,
+        missing_hook_label="tiles batch",
+        warn_message="Trim failed %s %s %s %s",
+        max_attempts=3,
+    )
+    assert attempts == [1, 1, 1]
+    assert usage == 10
+    assert "Trim failed" in caplog.text
+
+
+def test_safe_int_logs_once_for_invalid_values(caplog, monkeypatch) -> None:
+    """Invalid cache values should clamp to zero and log only once per label."""
+    monkeypatch.setattr("qpane.cache.consumers._INVALID_VALUE_LOGGED", set())
+    caplog.set_level("WARNING")
+    assert _safe_int("bad", label="tiles") == 0
+    assert _safe_int("bad", label="tiles") == 0
+    warnings = [
+        record for record in caplog.records if "Invalid cache metric" in record.message
+    ]
+    assert len(warnings) == 1
+
+
+def test_mask_overlay_consumer_trim_respects_exclude() -> None:
+    """Mask trims should exclude the active mask and stop when no bytes free."""
+
+    class _ControllerStub:
+        def __init__(self) -> None:
+            self.cache_usage_bytes = 10
+            self._active_mask_id = "active"
+            self.drop_calls: list[tuple[str, set[str] | None]] = []
+
+        def drop_oldest_cached_mask(self, *, reason: str, exclude=None) -> int:
+            self.drop_calls.append((reason, set(exclude or [])))
+            return 0
+
+        def get_active_mask_id(self):
+            return self._active_mask_id
+
+    controller = _ControllerStub()
+    coordinator = CacheCoordinator(active_budget_bytes=1024)
+    consumer = MaskOverlayCacheConsumer(controller, coordinator)
+    consumer._trim_to(0)
+    assert controller.drop_calls == [("coordinator", {"active"})]
+
+
+def test_sam_predictor_consumer_trims_and_updates_usage() -> None:
+    """SAM predictor trims should drop cache entries until usage meets target."""
+
+    class _ManagerStub:
+        def __init__(self) -> None:
+            self._paths = [Path("a"), Path("b")]
+            self._usage = 10
+
+        def cache_usage_bytes(self) -> int:
+            return self._usage
+
+        def pendingUsageBytes(self) -> int:
+            return 0
+
+        def predictorPaths(self):
+            return list(self._paths)
+
+        def removeFromCache(self, path: Path) -> bool:
+            if path in self._paths:
+                self._paths.remove(path)
+                self._usage = max(0, self._usage - 5)
+                return True
+            return False
+
+        def requestPredictor(self, image, path: Path) -> None:
+            return None
+
+        def cancelPendingPredictor(self, path: Path) -> bool:
+            return False
+
+        class _Signal:
+            def connect(self, _callback) -> None:
+                return None
+
+        predictorReady = _Signal()
+        predictorCacheCleared = _Signal()
+        predictorRemoved = _Signal()
+
+    manager = _ManagerStub()
+    coordinator = CacheCoordinator(active_budget_bytes=1024)
+    consumer = SamPredictorCacheConsumer(manager, coordinator)
+    consumer._trim_to(0)
+    snapshot = coordinator.snapshot()
+    assert snapshot["consumers"]["predictors"]["usage_bytes"] == 0

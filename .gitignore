@@ -1,0 +1,48 @@
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv*/
+examples/venv-*/
+examples/demo_settings.json
+
+# Mask autosave dumps
+**/saved_masks/
+
+# Build and distribution artifacts
+build/
+dist/
+*.egg-info/
+qpane.egg-info/
+.eggs/
+*.egg
+*.whl
+qpane/_version.py
+
+# Coverage reports
+.coverage
+coverage.xml
+htmlcov/
+
+# Logs
+*.log
+log.txt
+
+# Editor and OS files
+.vscode/
+.idea/
+.editorconfig
+*.swp
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Project-specific
+paktest/
+tests/perf/results/
+qpane/models/mobile_sam.pt

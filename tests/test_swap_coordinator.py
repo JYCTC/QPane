@@ -1,0 +1,693 @@
+#    QPane - High-performance PySide6 image viewer
+#    Copyright (C) 2025  Artificial Sweetener and contributors
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Unit tests for the SwapCoordinator orchestration logic."""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage
+
+from qpane.core import CacheSettings
+from qpane.core.config_features import SamConfigSlice
+from qpane.masks.workflow import MaskActivationSyncResult
+from qpane.rendering import ViewportZoomMode
+from qpane.rendering.tiles import TileIdentifier
+from qpane.swap.coordinator import SwapCoordinator
+
+
+class RecordingMaskService:
+    """Minimal mask service stub that records prefetch and cancel requests."""
+
+    def __init__(self) -> None:
+        self.controller = object()
+        self.prefetch_calls: list[tuple[uuid.UUID, str]] = []
+        self.cancel_calls: list[uuid.UUID | None] = []
+        self.manager = type(
+            "MaskManagerStub",
+            (),
+            {"get_mask_ids_for_image": staticmethod(lambda _image_id: [])},
+        )()
+
+    def connectUndoStackChanged(self, _callback) -> None:  # pragma: no cover - no-op
+        return
+
+    def disconnectUndoStackChanged(self, _callback) -> None:  # pragma: no cover - no-op
+        return
+
+    def refreshAutosavePolicy(self) -> None:  # pragma: no cover - no-op
+        return
+
+    def applyConfig(self, *_args, **_kwargs) -> None:  # pragma: no cover - no-op
+        return
+
+    def configureStrokeDiagnostics(
+        self, *_args, **_kwargs
+    ) -> None:  # pragma: no cover - no-op
+        return
+
+    def ensureTopMaskActiveForImage(self, _image_id: uuid.UUID) -> bool:
+        return True
+
+    def isActivationPending(self, _image_id: uuid.UUID | None) -> bool:
+        return False
+
+    def prefetchColorizedMasks(
+        self,
+        image_id: uuid.UUID | None,
+        *,
+        reason: str,
+        scales=None,
+    ) -> bool:
+        if image_id is None:
+            return False
+        self.prefetch_calls.append((image_id, reason))
+        return True
+
+    def cancelPrefetch(self, image_id: uuid.UUID | None) -> bool:
+        self.cancel_calls.append(image_id)
+        return image_id is not None
+
+
+class RecordingSamManager:
+    """Stub SAM manager that remembers predictor lifecycle events."""
+
+    def __init__(self) -> None:
+        self.requested: list[Path] = []
+        self.cancelled: list[Path] = []
+
+    def requestPredictor(self, _image: QImage, path: Path) -> None:
+        self.requested.append(path)
+
+    def cancelPendingPredictor(self, path: Path) -> bool:
+        self.cancelled.append(path)
+        return True
+
+
+class _SamAwareConfig:
+    """Minimal settings stub exposing cache and SAM slices."""
+
+    def __init__(self, *, predictor_depth: int, sam_depth: int | None) -> None:
+        self.cache = CacheSettings()
+        self.cache.prefetch.predictors = predictor_depth
+        sam_slice = SamConfigSlice()
+        sam_slice.sam_prefetch_depth = sam_depth
+        self._sam_slice = sam_slice
+
+    def for_feature(self, namespace: str) -> SamConfigSlice:
+        if namespace != "sam":
+            raise RuntimeError("unexpected namespace request")
+        return self._sam_slice
+
+
+def _solid_image(color: Qt.GlobalColor) -> QImage:
+    image = QImage(64, 64, QImage.Format_ARGB32)
+    image.fill(color)
+    return image
+
+
+class DummySignal:
+    """Minimal Qt-like signal stub."""
+
+    def __init__(self) -> None:
+        self._callbacks: list = []
+
+    def connect(self, callback) -> None:
+        self._callbacks.append(callback)
+
+    def emit(self, *args, **kwargs) -> None:
+        for callback in list(self._callbacks):
+            callback(*args, **kwargs)
+
+
+class StubTileManager:
+    """Tile manager stub exposing the methods SwapCoordinator expects."""
+
+    def __init__(self) -> None:
+        self.tileReady = DummySignal()
+        self.prefetch_calls: list[tuple[tuple[TileIdentifier, ...], str]] = []
+        self.cancel_calls: list[tuple[tuple[TileIdentifier, ...], str]] = []
+        self.removed_paths: list[Path] = []
+        self.cache_limit_bytes = 0
+        self.cache_usage_bytes = 0
+
+    def prefetch_tiles(self, identifiers, source_image, *, reason="prefetch"):
+        batch = tuple(identifiers)
+        self.prefetch_calls.append((batch, reason))
+        return identifiers
+
+    def cancel_prefetch(self, identifiers, *, reason: str) -> None:
+        batch = tuple(identifiers)
+        self.cancel_calls.append((batch, reason))
+
+    def remove_tiles_for_path(self, path: Path) -> None:
+        self.removed_paths.append(path)
+
+    def calculate_grid_dimensions(self, width: int, height: int) -> tuple[int, int]:
+        cols = max(1, width // 64)
+        rows = max(1, height // 64)
+        return cols, rows
+
+
+class StubPyramidManager:
+    """Pyramid manager stub capturing prefetch and cancel requests."""
+
+    def __init__(self) -> None:
+        self.pyramidReady = DummySignal()
+        self.prefetch_calls: list[tuple[Path, str]] = []
+        self.cancel_calls: list[tuple[tuple[Path, ...], str]] = []
+
+    def prefetch_pyramid(self, image, path: Path, reason: str = "prefetch") -> bool:
+        self.prefetch_calls.append((path, reason))
+        return True
+
+    def cancel_prefetch(self, paths, *, reason: str) -> None:
+        batch = tuple(paths)
+        self.cancel_calls.append((batch, reason))
+
+
+class StubViewport:
+    """Viewport stub tracking zoom mode changes."""
+
+    def __init__(self) -> None:
+        self.zoom = 1.0
+        self._zoom_mode = ViewportZoomMode.FIT
+        self.content_size = None
+
+    def setContentSize(self, size) -> None:
+        self.content_size = size
+
+    def setZoomFit(self) -> None:
+        self._zoom_mode = ViewportZoomMode.FIT
+
+    def get_zoom_mode(self) -> ViewportZoomMode:
+        return self._zoom_mode
+
+
+class StubView:
+    """QPane view stub providing tile manager and viewport accessors."""
+
+    def __init__(self, viewport: StubViewport, tile_manager: StubTileManager) -> None:
+        self.viewport = viewport
+        self.tile_manager = tile_manager
+        self.swap_delegate = SimpleNamespace()
+        self.buffers_allocated = False
+        self.aligned = False
+
+    def allocate_buffers(self) -> None:
+        self.buffers_allocated = True
+
+    def ensure_view_alignment(self, *, force: bool = False) -> None:
+        self.aligned = bool(force)
+
+
+class StubCatalogFacade:
+    """Facade mimicking QPane.catalog() semantics."""
+
+    def __init__(self, catalog: "StubCatalog") -> None:
+        self._catalog = catalog
+
+    def exitPlaceholderMode(self) -> None:
+        return
+
+    def imageCatalog(self) -> "StubCatalog":
+        return self._catalog
+
+
+class StubMaskWorkflow:
+    """Mask workflow stub recording activations and swap notifications."""
+
+    def __init__(self) -> None:
+        self.activation_calls: list[uuid.UUID | None] = []
+        self.swap_calls: list[tuple[uuid.UUID | None, bool]] = []
+
+    def sync_mask_activation_for_image(self, image_id: uuid.UUID):
+        self.activation_calls.append(image_id)
+        return MaskActivationSyncResult(activation_pending=False)
+
+    def on_swap_applied(self, image_id: uuid.UUID, *, activation_pending: bool) -> None:
+        self.swap_calls.append((image_id, activation_pending))
+
+
+@dataclass
+class _CatalogEntry:
+    image: QImage
+    path: Path
+
+
+class StubCatalog:
+    """Lightweight image catalog for coordinator tests."""
+
+    def __init__(self) -> None:
+        self._entries: dict[uuid.UUID, _CatalogEntry] = {}
+        self._order: list[uuid.UUID] = []
+        self._path_index: dict[Path, uuid.UUID] = {}
+        self.current_id: uuid.UUID | None = None
+        self.pyramid_manager = StubPyramidManager()
+
+    def add_image(self, image_id: uuid.UUID, image: QImage, path: Path) -> None:
+        self._entries[image_id] = _CatalogEntry(image=image, path=path)
+        self._order.append(image_id)
+        self._path_index[path] = image_id
+
+    def setCurrentImageID(self, image_id: uuid.UUID) -> None:
+        self.current_id = image_id
+
+    def getCurrentImage(self) -> QImage | None:
+        if self.current_id is None:
+            return None
+        return self._entries[self.current_id].image
+
+    def getCurrentPath(self) -> Path | None:
+        if self.current_id is None:
+            return None
+        return self._entries[self.current_id].path
+
+    def getImageIds(self) -> list[uuid.UUID]:
+        return list(self._order)
+
+    def getPath(self, image_id: uuid.UUID) -> Path | None:
+        entry = self._entries.get(image_id)
+        return None if entry is None else entry.path
+
+    def getImage(self, image_id: uuid.UUID) -> QImage | None:
+        entry = self._entries.get(image_id)
+        return None if entry is None else entry.image
+
+    def updateCurrentEntry(
+        self,
+        *,
+        image: QImage | None = None,
+        path: Path | None = None,
+    ) -> bool:
+        if self.current_id is None:
+            return False
+        entry = self._entries[self.current_id]
+        changed = False
+        if image is not None and image is not entry.image:
+            entry.image = image
+            changed = True
+        if path is not None and path != entry.path:
+            self._path_index.pop(entry.path, None)
+            entry.path = path
+            self._path_index[path] = self.current_id
+            changed = True
+        return changed
+
+    def getBestFitImage(self, path: Path, target_width: int) -> QImage | None:
+        image_id = self._path_index.get(path)
+        if image_id is None:
+            return None
+        return self._entries[image_id].image
+
+    def exitPlaceholderMode(self) -> None:
+        return
+
+    def imageCatalog(self) -> "StubCatalog":
+        return self
+
+
+class StubQPane:
+    """QPane stub exposing only the surface touched by SwapCoordinator."""
+
+    def __init__(
+        self,
+        catalog: StubCatalog,
+        viewport: StubViewport,
+        tile_manager: StubTileManager,
+    ) -> None:
+        self._catalog_impl = catalog
+        self._view = StubView(viewport, tile_manager)
+        self._masks_controller = StubMaskWorkflow()
+        self._diagnostics = SimpleNamespace(set_dirty=lambda *_args, **_kwargs: None)
+        self.currentImageChanged = DummySignal()
+        self.imageLoaded = DummySignal()
+        self.interaction = SimpleNamespace(overlays_resume_pending=False)
+        self._is_blank = False
+        self.original_image = QImage()
+        self._updates_enabled = True
+
+    def refreshCursor(self) -> None:
+        return
+
+    def _save_zoom_pan_for_current_image(self) -> None:
+        return
+
+    def _restore_zoom_pan_for_new_image(self, _image_id: uuid.UUID) -> None:
+        return
+
+    def _sync_mask_activation_for_image(self, image_id: uuid.UUID):
+        result = self._masks_controller.sync_mask_activation_for_image(image_id)
+        pending = getattr(result, "activation_pending", False)
+        self.interaction.overlays_resume_pending = bool(pending)
+        return result
+
+    def blank(self) -> None:
+        self._is_blank = True
+
+    def catalog(self) -> StubCatalogFacade:
+        return StubCatalogFacade(self._catalog_impl)
+
+    def view(self) -> StubView:
+        return self._view
+
+    def linkedGroups(self):
+        return []
+
+    def diagnostics(self):
+        return self._diagnostics
+
+    def setUpdatesEnabled(self, enabled: bool) -> None:
+        self._updates_enabled = enabled
+
+    def resetActiveSamPredictor(self) -> None:
+        return
+
+    def setMinimumSize(self, *_args, **_kwargs) -> None:
+        return
+
+    def minimumSizeHint(self):
+        return (0, 0)
+
+
+class SwapCoordinatorHarness:
+    """Fixture-style helper to construct a coordinator with stubs."""
+
+    def __init__(self) -> None:
+        self.catalog = StubCatalog()
+        self.viewport = StubViewport()
+        self.tile_manager = StubTileManager()
+        self.qpane = StubQPane(self.catalog, self.viewport, self.tile_manager)
+        self.coordinator = SwapCoordinator(
+            qpane=self.qpane,
+            catalog=self.catalog,
+            viewport=self.viewport,
+            tile_manager=self.tile_manager,
+        )
+        self.qpane.view().swap_delegate.coordinator = self.coordinator
+
+    def add_image(
+        self, *, color: Qt.GlobalColor, path: Path, image_id: uuid.UUID | None = None
+    ) -> uuid.UUID:
+        identifier = image_id or uuid.uuid4()
+        self.catalog.add_image(identifier, _solid_image(color), path)
+        return identifier
+
+    def set_current_image(self, image_id: uuid.UUID, **kwargs) -> None:
+        self.coordinator.set_current_image(image_id, **kwargs)
+
+
+@pytest.fixture()
+def harness():
+    return SwapCoordinatorHarness()
+
+
+def test_set_current_image_prefetches_neighbors(harness):
+    mask_service = RecordingMaskService()
+    harness.coordinator.on_mask_service_attached(mask_service)
+    mask_calls: list[tuple[uuid.UUID | None, bool]] = []
+    workflow = harness.qpane._masks_controller
+    original_on_swap_applied = workflow.on_swap_applied
+
+    def tracking_on_swap_applied(image_id, *, activation_pending):
+        mask_calls.append((image_id, activation_pending))
+        return original_on_swap_applied(
+            image_id,
+            activation_pending=activation_pending,
+        )
+
+    workflow.on_swap_applied = tracking_on_swap_applied
+    first_id = harness.add_image(color=Qt.red, path=Path("first.png"))
+    second_id = harness.add_image(color=Qt.blue, path=Path("second.png"))
+    harness.set_current_image(first_id)
+    mask_calls.clear()
+    emissions: list[uuid.UUID] = []
+    harness.qpane.currentImageChanged.connect(emissions.append)
+    baseline_prefetch_count = len(mask_service.prefetch_calls)
+    harness.set_current_image(second_id)
+    assert emissions == [second_id]
+    assert mask_calls
+    assert mask_calls[-1] == (second_id, False)
+    recent_prefetch_calls = mask_service.prefetch_calls[baseline_prefetch_count:]
+    assert recent_prefetch_calls, "expected neighbor prefetch to be scheduled"
+    scheduled_ids = {image_id for image_id, reason in recent_prefetch_calls}
+    assert scheduled_ids == {first_id}
+    assert all(reason == "neighbor" for _, reason in recent_prefetch_calls)
+    metrics = harness.coordinator.snapshot_metrics()
+    assert metrics.pending_mask_prefetch == len(recent_prefetch_calls)
+    assert metrics.pending_predictors >= 0
+
+
+def test_set_current_image_cancels_only_irrelevant_work(harness):
+    mask_service = RecordingMaskService()
+    harness.coordinator.on_mask_service_attached(mask_service)
+    sam_manager = RecordingSamManager()
+    harness.coordinator.on_sam_manager_attached(sam_manager)
+    cache_settings = CacheSettings()
+    cache_settings.prefetch.predictors = -1
+    harness.coordinator.apply_config(SimpleNamespace(cache=cache_settings))
+    path1, path2, path3 = (
+        Path("first.png"),
+        Path("second.png"),
+        Path("third.png"),
+    )
+    first_id = harness.add_image(color=Qt.white, path=path1)
+    harness.add_image(color=Qt.black, path=path2)
+    third_id = harness.add_image(color=Qt.green, path=path3)
+    harness.set_current_image(third_id)
+    assert path3 in sam_manager.requested
+    assert path3 in harness.coordinator._pending_predictor_paths
+    extra_mask_id = uuid.uuid4()
+    extra_path = Path("extra.png")
+    harness.coordinator._pending_mask_prefetch_ids.add(extra_mask_id)
+    harness.coordinator._pending_predictor_paths.add(extra_path)
+    harness.set_current_image(first_id)
+    assert extra_mask_id in mask_service.cancel_calls
+    assert third_id not in mask_service.cancel_calls
+    assert extra_path in sam_manager.cancelled
+    assert path3 in sam_manager.cancelled
+    assert path3 in harness.coordinator._pending_predictor_paths
+    harness.set_current_image(third_id)
+    assert path3 in sam_manager.requested
+    assert sam_manager.requested.count(path3) >= 2
+
+
+def test_set_current_image_reports_pending_activation(harness):
+    mask_service = RecordingMaskService()
+    harness.coordinator.on_mask_service_attached(mask_service)
+    first_id = harness.add_image(color=Qt.red, path=Path("first.png"))
+    second_id = harness.add_image(color=Qt.blue, path=Path("second.png"))
+    harness.set_current_image(first_id)
+    activation_requests: list[uuid.UUID | None] = []
+
+    def fake_sync(image_id):
+        activation_requests.append(image_id)
+        return MaskActivationSyncResult(activation_pending=True)
+
+    workflow = harness.qpane._masks_controller
+    workflow.sync_mask_activation_for_image = fake_sync
+    mask_calls: list[tuple[uuid.UUID | None, bool]] = []
+    original_on_swap_applied = workflow.on_swap_applied
+
+    def tracking_on_swap_applied(image_id, *, activation_pending):
+        mask_calls.append((image_id, activation_pending))
+        return original_on_swap_applied(
+            image_id,
+            activation_pending=activation_pending,
+        )
+
+    workflow.on_swap_applied = tracking_on_swap_applied
+    harness.set_current_image(second_id)
+    assert activation_requests[-1] == second_id
+    assert mask_calls[-1] == (second_id, True)
+    assert harness.qpane.interaction.overlays_resume_pending is True
+
+
+def test_apply_image_emits_loaded_and_fits_view(harness):
+    image = _solid_image(Qt.green)
+    source_path = Path("applied.png")
+    emissions: list[Path] = []
+    harness.qpane.imageLoaded.connect(emissions.append)
+    harness.coordinator.apply_image(image, source_path, fit_view=True)
+    assert emissions == [source_path]
+    assert harness.viewport.get_zoom_mode() == ViewportZoomMode.FIT
+    assert harness.qpane.original_image is image
+
+
+def test_prefetch_neighbors_tracks_tiles_and_pyramids(harness):
+    first_id = harness.add_image(color=Qt.red, path=Path("first.png"))
+    harness.add_image(color=Qt.blue, path=Path("second.png"))
+    harness.add_image(color=Qt.green, path=Path("third.png"))
+    harness.set_current_image(first_id)
+    coordinator = harness.coordinator
+    scheduled_pyramids: list[Path] = []
+    scheduled_tiles: list[list[TileIdentifier]] = []
+
+    def fake_prefetch_pyramid(image, path, reason="prefetch"):
+        scheduled_pyramids.append(path)
+        return True
+
+    def fake_prefetch_tiles(identifiers, source_image, *, reason="prefetch"):
+        batch = list(identifiers)
+        scheduled_tiles.append(batch)
+        return batch
+
+    harness.catalog.pyramid_manager.prefetch_pyramid = fake_prefetch_pyramid
+    harness.tile_manager.prefetch_tiles = fake_prefetch_tiles
+    coordinator._pending_pyramid_paths.clear()
+    coordinator._pyramid_prefetch_recent.clear()
+    coordinator._pending_tile_prefetch_ids.clear()
+    coordinator.prefetch_neighbors(first_id)
+    metrics = coordinator.snapshot_metrics()
+    assert metrics.pending_pyramid_prefetch == len(scheduled_pyramids)
+    total_tiles = sum(len(batch) for batch in scheduled_tiles)
+    assert metrics.pending_tile_prefetch == total_tiles
+    pending_tile_ids = coordinator._pending_tile_prefetch_ids
+    assert metrics.pending_tile_prefetch == len(pending_tile_ids)
+    coordinator._cancel_tile_prefetches(reason="test-clear")
+    coordinator._cancel_pyramid_prefetches(reason="test-clear")
+    metrics_after = coordinator.snapshot_metrics()
+    assert metrics_after.pending_pyramid_prefetch == 0
+    assert metrics_after.pending_tile_prefetch == 0
+
+
+def test_prefetch_tiles_depth_zero_disables_prefetch(harness):
+    first_id = harness.add_image(color=Qt.red, path=Path("first.png"))
+    harness.add_image(color=Qt.blue, path=Path("second.png"))
+    harness.set_current_image(first_id)
+    coordinator = harness.coordinator
+    calls: list[list[TileIdentifier]] = []
+
+    def fake_prefetch_tiles(identifiers, source_image, *, reason="prefetch"):
+        batch = list(identifiers)
+        calls.append(batch)
+        return batch
+
+    harness.tile_manager.prefetch_tiles = fake_prefetch_tiles
+    harness.catalog.pyramid_manager.prefetch_pyramid = lambda *args, **kwargs: False
+    cache_settings = CacheSettings()
+    cache_settings.prefetch.tiles = 0
+    coordinator.apply_config(SimpleNamespace(cache=cache_settings))
+    coordinator.prefetch_neighbors(first_id)
+    assert calls == []
+    metrics_snapshot = coordinator.snapshot_metrics()
+    assert metrics_snapshot.pending_tile_prefetch == 0
+
+
+def test_prefetch_tiles_respects_tiles_per_neighbor(harness):
+    harness.add_image(color=Qt.red, path=Path("first.png"))
+    second_id = harness.add_image(color=Qt.blue, path=Path("second.png"))
+    harness.add_image(color=Qt.green, path=Path("third.png"))
+    harness.set_current_image(second_id)
+    coordinator = harness.coordinator
+    cache_settings = CacheSettings()
+    cache_settings.prefetch.tiles = 2
+    cache_settings.prefetch.tiles_per_neighbor = 2
+    coordinator.apply_config(SimpleNamespace(cache=cache_settings))
+    scheduled_tiles: list[list[TileIdentifier]] = []
+
+    def fake_prefetch_tiles(identifiers, source_image, *, reason="prefetch"):
+        batch = list(identifiers)
+        scheduled_tiles.append(batch)
+        return batch
+
+    harness.tile_manager.prefetch_tiles = fake_prefetch_tiles
+    coordinator.prefetch_neighbors(second_id)
+    assert scheduled_tiles
+    assert all(len(batch) <= 2 for batch in scheduled_tiles)
+    total_tiles = sum(len(batch) for batch in scheduled_tiles)
+    assert total_tiles <= 4
+
+
+def test_prefetch_pyramids_skips_recent_duplicates(harness, monkeypatch):
+    first_id = harness.add_image(color=Qt.red, path=Path("first.png"))
+    harness.add_image(color=Qt.blue, path=Path("second.png"))
+    manager = harness.catalog.pyramid_manager
+    calls: list[Path] = []
+
+    def fake_prefetch(image, path, reason="prefetch"):
+        calls.append(path)
+        return True
+
+    manager.prefetch_pyramid = fake_prefetch
+    harness.set_current_image(first_id)
+    from qpane.swap import coordinator as swap_coordinator_module
+
+    clock = {"value": 1000.0}
+
+    def fake_monotonic():
+        return clock["value"]
+
+    monkeypatch.setattr(
+        swap_coordinator_module.time,
+        "monotonic",
+        fake_monotonic,
+    )
+    monkeypatch.setattr(
+        swap_coordinator_module,
+        "PYRAMID_RESUBMIT_COOLDOWN_SEC",
+        1.0,
+    )
+    swap_coordinator = harness.coordinator
+    swap_coordinator._pending_pyramid_paths.clear()
+    swap_coordinator._pyramid_prefetch_recent.clear()
+    swap_coordinator.prefetch_neighbors(first_id)
+    assert calls
+    swap_coordinator._pending_pyramid_paths.clear()
+    baseline = len(calls)
+    clock["value"] += 0.2
+    swap_coordinator.prefetch_neighbors(first_id)
+    assert len(calls) == baseline
+    swap_coordinator._pending_pyramid_paths.clear()
+    clock["value"] += 2.0
+    swap_coordinator.prefetch_neighbors(first_id)
+    assert len(calls) > baseline
+    scheduled_tiles: list[list[TileIdentifier]] = []
+
+    def fake_prefetch_tiles(identifiers, source_image, *, reason="prefetch"):
+        batch = list(identifiers)
+        scheduled_tiles.append(batch)
+        return batch
+
+    harness.tile_manager.prefetch_tiles = fake_prefetch_tiles
+    harness.catalog.pyramid_manager.prefetch_pyramid = lambda *args, **kwargs: False
+    cache_settings = CacheSettings()
+    cache_settings.prefetch.tiles = 1
+    cache_settings.prefetch.tiles_per_neighbor = 1
+    cache_settings.prefetch.pyramids = 0
+    swap_coordinator.apply_config(SimpleNamespace(cache=cache_settings))
+    swap_coordinator.prefetch_neighbors(first_id)
+    metrics = swap_coordinator.snapshot_metrics()
+    total_tiles = sum(len(batch) for batch in scheduled_tiles)
+    assert total_tiles == metrics.pending_tile_prefetch
+    assert all(len(batch) <= 1 for batch in scheduled_tiles)
+    assert len(scheduled_tiles) <= 1
+
+
+def test_sam_prefetch_depth_overrides_cache_when_configured(harness):
+    coordinator = harness.coordinator
+    coordinator.apply_config(_SamAwareConfig(predictor_depth=3, sam_depth=None))
+    assert coordinator._predictor_prefetch_depth == 3
+    coordinator.apply_config(_SamAwareConfig(predictor_depth=3, sam_depth=1))
+    assert coordinator._predictor_prefetch_depth == 1
+    coordinator.apply_config(_SamAwareConfig(predictor_depth=0, sam_depth=-1))
+    assert coordinator._predictor_prefetch_depth == -1

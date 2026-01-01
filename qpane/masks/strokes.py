@@ -1,0 +1,851 @@
+#    QPane - High-performance PySide6 image viewer
+#    Copyright (C) 2025  Artificial Sweetener and contributors
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Stroke queueing and preview helpers owned by the mask workflow."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field, replace
+from itertools import count
+from typing import TYPE_CHECKING, Callable, Mapping, MutableMapping
+from uuid import UUID
+
+import numpy as np
+from PySide6.QtCore import QPoint, QPointF, QRect
+from PySide6.QtGui import QBrush, QImage, QPainter, QPen, Qt
+
+from ..catalog.image_utils import (
+    numpy_to_qimage_grayscale8,
+    qimage_to_numpy_view_grayscale8,
+)
+from ..concurrency import TaskExecutorProtocol, TaskHandle
+from .mask_controller import (
+    MaskController,
+    MaskStrokeJobResult,
+    MaskStrokeJobSpec,
+    MaskStrokePayload,
+    MaskStrokeSegmentPayload,
+)
+from .mask_diagnostics import MaskStrokeDiagnostics
+from .stroke_render import stroke_pen_width, stroke_radius
+from .stroke_worker import MaskStrokeWorker
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ..qpane import QPane
+    from .mask_service import MaskService
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MaskStrokeDebugSnapshot:
+    """Represent pending stroke bookkeeping for assertions and diagnostics."""
+
+    preview_state_ids: tuple[UUID, ...] = tuple()
+    preview_tokens: dict[UUID, int] = field(default_factory=dict)
+    pending_jobs: dict[UUID, tuple[TaskHandle, ...]] = field(default_factory=dict)
+    forced_drop_masks: tuple[UUID, ...] = tuple()
+
+
+@dataclass(slots=True)
+class _DecimatedStrokeState:
+    """Track an in-flight stroke rendered against a stride-reduced preview."""
+
+    mask_id: UUID
+    stride: int
+    _segments: list[MaskStrokeSegmentPayload] = field(default_factory=list)
+    _dirty_rect: QRect | None = None
+
+    def reset(self) -> None:
+        """Clear recorded segments and tracked dirty bounds."""
+        self._segments.clear()
+        self._dirty_rect = None
+
+    def has_segments(self) -> bool:
+        """Return True when the stroke has recorded paint operations."""
+        return bool(self._segments)
+
+    def preview_segment(
+        self,
+        *,
+        dirty_rect: QRect,
+        start_point: QPoint,
+        end_point: QPoint,
+        erase: bool,
+        brush_size: int,
+        mask_view: np.ndarray,
+    ) -> QImage:
+        """Render a decimated preview snippet for the provided segment."""
+        segment = MaskStrokeSegmentPayload(
+            start=(int(start_point.x()), int(start_point.y())),
+            end=(int(end_point.x()), int(end_point.y())),
+            brush_size=int(brush_size),
+            erase=bool(erase),
+        )
+        self._segments.append(segment)
+        rect_copy = QRect(dirty_rect)
+        if self._dirty_rect is None:
+            self._dirty_rect = rect_copy
+        else:
+            self._dirty_rect = self._dirty_rect.united(rect_copy)
+        stride = max(1, self.stride)
+        y0 = rect_copy.top()
+        x0 = rect_copy.left()
+        y1 = rect_copy.bottom() + 1
+        x1 = rect_copy.right() + 1
+        preview_slice = mask_view[y0:y1:stride, x0:x1:stride].copy()
+        preview_image = numpy_to_qimage_grayscale8(preview_slice)
+        painter = QPainter(preview_image)
+        try:
+            for recorded in self._segments:
+                start_qpoint = QPoint(recorded.start[0], recorded.start[1])
+                end_qpoint = QPoint(recorded.end[0], recorded.end[1])
+                segment_rect = QRect(start_qpoint, end_qpoint).normalized()
+                segment_margin = int(recorded.brush_size / 2) + 2
+                segment_rect = segment_rect.adjusted(
+                    -segment_margin,
+                    -segment_margin,
+                    segment_margin,
+                    segment_margin,
+                )
+                if not segment_rect.intersects(rect_copy):
+                    continue
+                draw_color = (
+                    Qt.GlobalColor.black if recorded.erase else Qt.GlobalColor.white
+                )
+                pen = QPen()
+                pen.setWidth(stroke_pen_width(recorded.brush_size, stride=stride))
+                pen.setColor(draw_color)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(pen)
+                start_offset = QPointF(
+                    (start_qpoint.x() - rect_copy.left()) / stride,
+                    (start_qpoint.y() - rect_copy.top()) / stride,
+                )
+                end_offset = QPointF(
+                    (end_qpoint.x() - rect_copy.left()) / stride,
+                    (end_qpoint.y() - rect_copy.top()) / stride,
+                )
+                painter.drawLine(start_offset, end_offset)
+                if recorded.start == recorded.end:
+                    painter.setBrush(QBrush(draw_color))
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    radius = stroke_radius(recorded.brush_size, stride=stride)
+                    painter.drawEllipse(start_offset, radius, radius)
+        finally:
+            painter.end()
+        preview_image.setText("qpane_preview_stride", str(stride))
+        preview_image.setText("qpane_preview_provisional", "1")
+        return preview_image
+
+    def _build_payload(self) -> MaskStrokePayload:
+        """Return the recorded segments packaged for worker execution."""
+        segments = tuple(self._segments)
+        metadata = {"segment_count": len(segments), "stride": self.stride}
+        metadata["source"] = "decimated" if self.stride > 1 else "direct"
+        return MaskStrokePayload(
+            segments=segments,
+            stride=self.stride,
+            metadata=metadata,
+        )
+
+    def flush_to_mask(
+        self,
+        *,
+        controller: MaskController,
+        submit_job: Callable[[MaskStrokeJobSpec, bool, str, bool, int], bool],
+        clear_preview_state: bool,
+        source: str,
+        commit: bool,
+        allocate_job_token: Callable[[], int],
+        register_job_token: Callable[[UUID, int], int | None],
+        restore_job_token: Callable[[UUID, int | None], None],
+    ) -> bool:
+        """Ship recorded segments to a worker for final application."""
+        if not self._segments or self._dirty_rect is None:
+            self.reset()
+            return False
+        rect = QRect(self._dirty_rect)
+        payload = self._build_payload()
+        spec = controller.prepareStrokeJob(
+            self.mask_id,
+            rect,
+            payload=payload,
+            metadata=dict(payload.metadata),
+        )
+        if spec is None:
+            self.reset()
+            return False
+        job_token = allocate_job_token()
+        metadata = dict(spec.metadata)
+        metadata["job_token"] = job_token
+        previous_token = register_job_token(self.mask_id, job_token)
+        if previous_token is not None:
+            metadata["allow_generation_rebase"] = True
+        spec_with_token = replace(spec, metadata=metadata)
+        logger.debug(
+            "prepared stroke job mask=%s gen=%s commit=%s source=%s token=%s",
+            spec_with_token.mask_id,
+            spec_with_token.generation,
+            commit,
+            source,
+            job_token,
+        )
+        try:
+            queued = submit_job(
+                spec_with_token,
+                clear_preview_state=clear_preview_state,
+                source=source,
+                commit=commit,
+                job_token=job_token,
+            )
+        except Exception:
+            restore_job_token(self.mask_id, previous_token)
+            self.reset()
+            raise
+        if not queued:
+            restore_job_token(self.mask_id, previous_token)
+        self.reset()
+        return queued
+
+
+class MaskStrokePipeline:
+    """Own mask stroke preview state, worker submission, and diagnostics."""
+
+    def __init__(
+        self,
+        *,
+        qpane: "QPane",
+        service: "MaskService",
+        diagnostics: MaskStrokeDiagnostics | None = None,
+    ) -> None:
+        """Initialize stroke pipeline state, tokens, and optional diagnostics."""
+        self._qpane = qpane
+        self._service = service
+        self._preview_states: dict[UUID, _DecimatedStrokeState] = {}
+        self._preview_tokens: dict[UUID, int] = {}
+        self._pending_jobs: dict[UUID, set[TaskHandle]] = {}
+        self._forced_drop_masks: set[UUID] = set()
+        self._job_token_counter = count(1)
+        self._diagnostics = diagnostics
+        self._idle_callback: Callable[[UUID], None] | None = None
+
+    @property
+    def diagnostics(self) -> MaskStrokeDiagnostics | None:
+        """Return the diagnostics tracker backing stroke metrics when set."""
+        return self._diagnostics
+
+    def set_diagnostics(self, tracker: MaskStrokeDiagnostics | None) -> None:
+        """Replace the diagnostics tracker used for job telemetry."""
+        self._diagnostics = tracker
+
+    def set_idle_callback(self, callback: Callable[[UUID], None] | None) -> None:
+        """Register a callback invoked when a mask finishes stroke work."""
+        self._idle_callback = callback
+
+    def is_mask_busy(self, mask_id: UUID) -> bool:
+        """Return True when a mask tracks preview state or pending jobs."""
+        if mask_id in self._preview_states:
+            return True
+        if mask_id in self._preview_tokens:
+            return True
+        pending = self._pending_jobs.get(mask_id)
+        return bool(pending)
+
+    def configure_diagnostics(self, *, enabled: bool) -> None:
+        """Apply runtime toggles to the current diagnostics tracker."""
+        tracker = self._diagnostics
+        if tracker is None:
+            return
+        tracker.configure(enabled=enabled)
+
+    def diagnostics_snapshot(self):
+        """Return the snapshot emitted by the diagnostics tracker when available."""
+        tracker = self._diagnostics
+        if tracker is None:
+            return None
+        return tracker.snapshot()
+
+    def debug_snapshot(self) -> MaskStrokeDebugSnapshot:
+        """Expose pending state for tests without leaking internal dicts."""
+        pending = {
+            mask_id: tuple(handles)
+            for mask_id, handles in self._pending_jobs.items()
+            if handles
+        }
+        return MaskStrokeDebugSnapshot(
+            preview_state_ids=tuple(self._preview_states.keys()),
+            preview_tokens=dict(self._preview_tokens),
+            pending_jobs=pending,
+            forced_drop_masks=tuple(self._forced_drop_masks),
+        )
+
+    def reset_state(
+        self,
+        mask_id: UUID | None,
+        *,
+        clear_counter: bool = False,
+        request_redraw: bool = True,
+    ) -> None:
+        """Cancel pending stroke jobs and drop preview state."""
+        preview_states: MutableMapping[UUID, _DecimatedStrokeState] = (
+            self._preview_states
+        )
+        preview_tokens: MutableMapping[UUID, int] = self._preview_tokens
+        forced_drop_masks = self._forced_drop_masks
+        pending_jobs = self._pending_jobs
+        executor = self._executor
+        service = self._service
+        manager = getattr(service, "manager", None)
+        diagnostics = self._diagnostics
+        target_ids: set[UUID] = set()
+        if mask_id is None:
+            target_ids.update(preview_states.keys())
+            target_ids.update(preview_tokens.keys())
+            target_ids.update(pending_jobs.keys())
+        else:
+            target_ids.add(mask_id)
+        had_targets = bool(target_ids)
+        for target in tuple(target_ids):
+            had_state = False
+            handles = pending_jobs.get(target)
+            if handles:
+                had_state = True
+                if executor is not None and hasattr(executor, "cancel"):
+                    for handle in tuple(handles):
+                        try:
+                            executor.cancel(handle)
+                        except Exception:  # pragma: no cover - defensive guard
+                            logger.debug(
+                                "Failed to cancel pending mask stroke job (mask=%s).",
+                                target,
+                                exc_info=True,
+                            )
+                handles.clear()
+                pending_jobs.pop(target, None)
+            else:
+                pending_jobs.pop(target, None)
+            if target in preview_states:
+                had_state = True
+                preview_states.pop(target, None)
+            if target in preview_tokens:
+                had_state = True
+                preview_tokens.pop(target, None)
+            if had_state:
+                forced_drop_masks.add(target)
+                if request_redraw and manager is not None:
+                    layer = manager.get_layer(target)
+                    if layer is not None and not layer.mask_image.isNull():
+                        self._qpane.updateMaskRegion(layer.mask_image.rect(), layer)
+                if diagnostics is not None:
+                    diagnostics.cancel_mask_jobs(target)
+        if mask_id is None:
+            pending_jobs.clear()
+            preview_states.clear()
+            preview_tokens.clear()
+            if not had_targets:
+                forced_drop_masks.clear()
+            if clear_counter:
+                self._job_token_counter = count(1)
+                if diagnostics is not None:
+                    diagnostics.reset()
+        elif clear_counter:
+            self._job_token_counter = count(1)
+        for target in target_ids:
+            self._notify_idle_if_clear(target)
+
+    @property
+    def _executor(self) -> TaskExecutorProtocol | None:
+        """Expose the mask service executor when available."""
+        return getattr(self._service, "_executor", None)
+
+    def _allocate_job_token(self) -> int:
+        """Return the next stroke job token for diagnostics and ordering."""
+        return next(self._job_token_counter)
+
+    def _register_job_token(self, mask_id: UUID, token: int) -> int | None:
+        """Record the current preview token for ``mask_id`` and return the previous."""
+        previous = self._preview_tokens.get(mask_id)
+        self._preview_tokens[mask_id] = token
+        return previous
+
+    def _restore_job_token(self, mask_id: UUID, token: int | None) -> None:
+        """Restore or clear the preview token for ``mask_id`` after a submit."""
+        if token is None:
+            self._preview_tokens.pop(mask_id, None)
+        else:
+            self._preview_tokens[mask_id] = token
+
+    def _submit_stroke_job(
+        self,
+        spec: MaskStrokeJobSpec,
+        *,
+        clear_preview_state: bool,
+        source: str,
+        commit: bool,
+        job_token: int,
+    ) -> bool:
+        """Queue a stroke worker and wire finalize callbacks/diagnostics."""
+        executor = self._executor
+        handle_box: dict[str, TaskHandle | None] = {"handle": None}
+        completed = {"value": False}
+        diagnostics = self._diagnostics
+        pending_jobs = self._pending_jobs
+        if diagnostics is not None:
+            pending_handles = pending_jobs.get(spec.mask_id)
+            pending_count = len(pending_handles) if pending_handles else 0
+            stride_value = None
+            metadata_mapping = (
+                spec.metadata if isinstance(spec.metadata, Mapping) else None
+            )
+            if metadata_mapping is not None:
+                stride_candidate = metadata_mapping.get("stride")
+                try:
+                    stride_value = int(stride_candidate)
+                except (TypeError, ValueError):
+                    stride_value = None
+            diagnostics.record_submitted(
+                mask_id=spec.mask_id,
+                job_token=job_token,
+                generation=spec.generation,
+                pending_count=pending_count,
+                source=source,
+                stride=stride_value,
+            )
+
+        def finalize(result: MaskStrokeJobResult) -> None:
+            """Finalize stroke results and propagate completion state."""
+            completed["value"] = True
+            self._finalize_stroke_result(
+                result,
+                handle=handle_box["handle"],
+                clear_preview_state=clear_preview_state,
+                commit=commit,
+            )
+
+        logger.debug(
+            "queue stroke job mask=%s gen=%s token=%s source=%s",
+            spec.mask_id,
+            spec.generation,
+            job_token,
+            source,
+        )
+        worker = MaskStrokeWorker(spec=spec, finalize=finalize)
+        if executor is None:
+            worker.run()
+            return True
+        try:
+            handle = executor.submit(
+                worker,
+                category="mask_stroke",
+                device=str(spec.mask_id),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to queue mask stroke worker (mask=%s source=%s); executing synchronously.",
+                spec.mask_id,
+                source,
+            )
+            worker.run()
+            return True
+        handle_box["handle"] = handle
+        if not completed["value"]:
+            pending = pending_jobs.setdefault(spec.mask_id, set())
+            pending.add(handle)
+        return True
+
+    def _finalize_stroke_result(
+        self,
+        result: MaskStrokeJobResult,
+        *,
+        handle: TaskHandle | None,
+        clear_preview_state: bool,
+        commit: bool,
+    ) -> None:
+        """Merge a completed stroke, update diagnostics, and clean pending state."""
+        qpane = self._qpane
+        service = self._service
+        controller = service.controller
+        mask_id = result.mask_id
+        diagnostics = self._diagnostics
+        log_fn = logger.debug
+        pending = self._pending_jobs.get(mask_id)
+        if pending is not None:
+            if handle is not None:
+                pending.discard(handle)
+            if not pending:
+                self._pending_jobs.pop(mask_id, None)
+        metadata_mapping = (
+            result.metadata if isinstance(result.metadata, Mapping) else {}
+        )
+        job_token = metadata_mapping.get("job_token")
+
+        def _clear_pending_token(target_mask_id: UUID, token_value: int | None) -> None:
+            """Drop preview token if it matches the finalized job token."""
+            if token_value is None:
+                return
+            if self._preview_tokens.get(target_mask_id) == token_value:
+                self._preview_tokens.pop(target_mask_id, None)
+
+        if clear_preview_state:
+            self._preview_states.pop(mask_id, None)
+
+        def _record_completion(
+            status: str,
+            *,
+            detail: str | None = None,
+            target_mask_id: UUID | None = mask_id,
+            token_value: int | None = job_token,
+        ) -> None:
+            """Record a completed job outcome with optional detail."""
+            if diagnostics is None:
+                return
+            diagnostics.record_completed(
+                mask_id=target_mask_id,
+                job_token=token_value,
+                status=status,
+                detail=detail,
+            )
+
+        def _record_drop(
+            reason: str,
+            *,
+            detail: str | None = None,
+            target_mask_id: UUID | None = mask_id,
+            token_value: int | None = job_token,
+        ) -> None:
+            """Record a dropped job outcome with optional detail."""
+            if diagnostics is None:
+                return
+            diagnostics.record_drop(
+                mask_id=target_mask_id,
+                job_token=token_value,
+                reason=reason,
+                detail=detail,
+            )
+
+        def _notify_idle() -> None:
+            """Trigger idle callback when no pending work remains for mask."""
+            self._notify_idle_if_clear(mask_id)
+
+        mask_manager = service.manager
+        if mask_manager is None:
+            _clear_pending_token(mask_id, job_token)
+            _record_drop("missing_manager", detail="manager_unavailable")
+            _notify_idle()
+            return
+        mask_layer = mask_manager.get_layer(mask_id)
+        if mask_layer is None:
+            logger.warning(
+                "Mask stroke finalizer skipped: layer missing (mask=%s).",
+                mask_id,
+            )
+            _clear_pending_token(mask_id, job_token)
+            _record_drop("missing_layer")
+            _notify_idle()
+            return
+        active_mask_id = service.getActiveMaskId()
+        if commit and active_mask_id is not None and active_mask_id != mask_id:
+            logger.info(
+                "Discarding stroke finalize for mask %s; active mask changed to %s.",
+                mask_id,
+                active_mask_id,
+            )
+            qpane.updateMaskRegion(result.dirty_rect, mask_layer)
+            controller.commitStroke(mask_id)
+            _clear_pending_token(mask_id, job_token)
+            _record_drop(
+                "mask_changed",
+                detail=f"active={active_mask_id}",
+            )
+            _notify_idle()
+            return
+        expected_generation = controller.getMaskGeneration(mask_id)
+        allow_rebase = bool(metadata_mapping.get("allow_generation_rebase"))
+        if result.generation != expected_generation:
+            if result.generation > expected_generation:
+                logger.debug(
+                    "clamping future stroke job generation (mask=%s job_gen=%s expected=%s)",
+                    mask_id,
+                    result.generation,
+                    expected_generation,
+                )
+                job_result = replace(result, generation=expected_generation)
+            elif allow_rebase and result.generation < expected_generation:
+                logger.debug(
+                    "rebasing stroke job generation (mask=%s job_gen=%s expected=%s)",
+                    mask_id,
+                    result.generation,
+                    expected_generation,
+                )
+                job_result = replace(result, generation=expected_generation)
+            else:
+                job_result = result
+        else:
+            job_result = result
+
+        def _on_stale(
+            stale_job: MaskStrokeJobResult,
+            *,
+            reason: str = "stale_generation",
+            detail: str | None = None,
+        ) -> None:
+            """Handle stale results by reverting preview state and logging drops."""
+            if clear_preview_state:
+                self._preview_states.pop(stale_job.mask_id, None)
+            stale_metadata = stale_job.metadata
+            stale_token = (
+                stale_metadata.get("job_token")
+                if isinstance(stale_metadata, Mapping)
+                else None
+            )
+            _clear_pending_token(stale_job.mask_id, stale_token)
+            latest_layer = mask_manager.get_layer(stale_job.mask_id)
+            if latest_layer is not None:
+                qpane.updateMaskRegion(stale_job.dirty_rect, latest_layer)
+            if diagnostics is not None:
+                diagnostics.record_drop(
+                    mask_id=stale_job.mask_id,
+                    job_token=stale_token,
+                    reason=reason,
+                    detail=detail,
+                )
+            self._notify_idle_if_clear(stale_job.mask_id)
+
+        if mask_id in self._forced_drop_masks:
+            self._forced_drop_masks.discard(mask_id)
+            _on_stale(job_result, reason="forced_drop", detail="reset_state")
+            if commit:
+                controller.commitStroke(job_result.mask_id)
+            _notify_idle()
+            return
+        expected_token = self._preview_tokens.get(mask_id)
+        if (
+            job_token is not None
+            and expected_token is not None
+            and job_token != expected_token
+        ):
+            log_fn(
+                "stroke finalize dropped due to stale token (mask=%s job_token=%s expected=%s)",
+                mask_id,
+                job_token,
+                expected_token,
+            )
+            _on_stale(
+                job_result,
+                reason="stale_token",
+                detail=f"expected={expected_token}",
+            )
+            _notify_idle()
+            return
+        applied = controller.applyStrokeJob(job_result, on_stale=_on_stale)
+        if not applied:
+            log_fn(
+                "stroke finalize dropped: mask=%s gen=%s expected=%s pending=%s",
+                job_result.mask_id,
+                job_result.generation,
+                controller.getMaskGeneration(job_result.mask_id),
+                bool(self._pending_jobs.get(job_result.mask_id)),
+            )
+            if commit:
+                controller.commitStroke(job_result.mask_id)
+            _clear_pending_token(job_result.mask_id, job_token)
+            _record_drop("controller_rejected")
+            _notify_idle()
+            return
+        preview_image = job_result.preview_image
+        if preview_image is not None:
+            stride_value = job_result.metadata.get("stride")
+            if stride_value is not None:
+                try:
+                    stride_text = str(int(stride_value))
+                except (TypeError, ValueError):
+                    stride_text = None
+                if stride_text is not None:
+                    preview_image.setText("qpane_preview_stride", stride_text)
+            preview_image.setText(
+                "qpane_preview_provisional",
+                "0" if commit else "1",
+            )
+            qpane.updateMaskRegion(
+                job_result.dirty_rect,
+                mask_layer,
+                sub_mask_image=preview_image,
+            )
+        else:
+            qpane.updateMaskRegion(job_result.dirty_rect, mask_layer)
+        if commit:
+            controller.commitStroke(job_result.mask_id)
+            _record_completion("committed")
+        else:
+            _record_completion("applied", detail="preview")
+        _clear_pending_token(job_result.mask_id, job_token)
+        _notify_idle()
+
+    def apply_stroke_segment(
+        self,
+        start_point: QPoint,
+        end_point: QPoint,
+        is_erase: bool,
+    ) -> None:
+        """Render a preview segment and enqueue work for the active mask."""
+        qpane = self._qpane
+        workflow = qpane._masks_controller
+        if not workflow.mask_feature_available():
+            return
+        service = self._service
+        catalog = qpane.catalog()
+        current_image_id = catalog.currentImageID()
+        if not service.ensureTopMaskActiveForImage(current_image_id):
+            logger.info(
+                "Brush stroke skipped: no mask is ready for image %s.",
+                current_image_id,
+            )
+            return
+        active_mask_id = service.getActiveMaskId()
+        if active_mask_id is None:
+            logger.warning("Brush stroke skipped: no active mask selected.")
+            return
+        mask_manager = service.manager
+        if current_image_id is not None and mask_manager is not None:
+            mask_ids = mask_manager.get_mask_ids_for_image(current_image_id)
+            if active_mask_id not in mask_ids:
+                logger.warning(
+                    "Brush stroke skipped: active mask %s is not linked to image %s.",
+                    active_mask_id,
+                    current_image_id,
+                )
+                return
+        mask_layer = mask_manager.get_layer(active_mask_id) if mask_manager else None
+        if mask_layer is None:
+            logger.warning(
+                "Brush stroke skipped: mask %s has no backing layer.",
+                active_mask_id,
+            )
+            return
+        if mask_layer.mask_image.isNull():
+            logger.warning(
+                "Brush stroke skipped: mask %s image is null.",
+                active_mask_id,
+            )
+            return
+        controller = service.controller
+        mask_image = mask_layer.mask_image
+        mask_bounds = mask_image.rect()
+        stroke_rect = QRect(start_point, end_point).normalized()
+        margin = int(qpane.interaction.brush_size / 2) + 2
+        dirty_rect = stroke_rect.adjusted(-margin, -margin, margin, margin)
+        dirty_rect = dirty_rect.intersected(mask_bounds)
+        if dirty_rect.isNull() or dirty_rect.isEmpty():
+            return
+        try:
+            view = qpane.view()
+        except AttributeError:
+            logger.debug("Mask preview requested before view initialization")
+            return
+        viewport = view.viewport
+        zoom = getattr(viewport, "zoom", 1.0) or 1.0
+        stride = 1
+        if zoom < 1.0:
+            stride = max(1, int(round(1.0 / max(zoom, 1e-6))))
+        state = self._preview_states.get(active_mask_id)
+        view_array, _ = qimage_to_numpy_view_grayscale8(mask_image)
+        if state is not None and state.stride != stride:
+            logger.debug(
+                "flushing preview state due to stride change (mask=%s old_stride=%s new_stride=%s segments=%s)",
+                active_mask_id,
+                state.stride,
+                stride,
+                len(state._segments),
+            )
+            state.flush_to_mask(
+                controller=controller,
+                submit_job=self._submit_stroke_job,
+                clear_preview_state=True,
+                source="stroke-final",
+                commit=False,
+                allocate_job_token=self._allocate_job_token,
+                register_job_token=self._register_job_token,
+                restore_job_token=self._restore_job_token,
+            )
+            self._preview_states.pop(active_mask_id, None)
+            state = None
+        if dirty_rect.isNull() or dirty_rect.isEmpty():
+            qpane.updateMaskRegion(dirty_rect, mask_layer)
+            return
+        if state is None:
+            state = _DecimatedStrokeState(mask_id=active_mask_id, stride=stride)
+            self._preview_states[active_mask_id] = state
+        preview_image = state.preview_segment(
+            dirty_rect=dirty_rect,
+            start_point=start_point,
+            end_point=end_point,
+            erase=is_erase,
+            brush_size=qpane.interaction.brush_size,
+            mask_view=view_array,
+        )
+        qpane.updateMaskRegion(
+            dirty_rect,
+            mask_layer,
+            sub_mask_image=preview_image,
+        )
+
+    def commit_active_stroke(self) -> None:
+        """Flush any recorded stroke segments for the active mask."""
+        workflow = self._qpane._masks_controller
+        if not workflow.mask_feature_available():
+            return
+        service = self._service
+        mask_id = service.getActiveMaskId()
+        if mask_id is None:
+            logger.warning("commit_active_stroke skipped: no active mask selected.")
+            return
+        controller = service.controller
+        state = self._preview_states.pop(mask_id, None)
+        if state is None:
+            logger.debug(
+                "commit_active_stroke skipped: no preview state for mask %s.",
+                mask_id,
+            )
+            return
+        queued = state.flush_to_mask(
+            controller=controller,
+            submit_job=self._submit_stroke_job,
+            clear_preview_state=True,
+            source="stroke-final",
+            commit=True,
+            allocate_job_token=self._allocate_job_token,
+            register_job_token=self._register_job_token,
+            restore_job_token=self._restore_job_token,
+        )
+        if not queued:
+            controller.commitStroke(mask_id)
+        self._notify_idle_if_clear(mask_id)
+
+    def _notify_idle_if_clear(self, mask_id: UUID | None) -> None:
+        """Invoke the idle callback when ``mask_id`` has no pending stroke state."""
+        if mask_id is None:
+            return
+        if self.is_mask_busy(mask_id):
+            return
+        callback = self._idle_callback
+        if callback is None:
+            return
+        try:
+            callback(mask_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Idle callback for mask %s failed", mask_id)

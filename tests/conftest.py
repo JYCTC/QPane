@@ -1,0 +1,100 @@
+#    QPane - High-performance PySide6 image viewer
+#    Copyright (C) 2025  Artificial Sweetener and contributors
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import os
+from pathlib import Path
+from typing import Iterator
+import pytest
+from PySide6.QtWidgets import QApplication
+from qpane.core import config
+from qpane import QPane
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    yield app
+
+
+@pytest.fixture()
+def qpane_core(qapp: QApplication) -> Iterator[QPane]:
+    """Provision a bare QPane instance and ensure it is cleaned up."""
+    qpane = QPane(features=())
+    try:
+        yield qpane
+    finally:
+        qpane.deleteLater()
+        qapp.processEvents()
+
+
+@pytest.fixture()
+def qpane_view(qpane_core: QPane):
+    """Expose the view collaborator for rendering-focused tests."""
+    return qpane_core.view()
+
+
+@pytest.fixture()
+def qpane_presenter(qpane_view):
+    """Return the RenderingPresenter owned by the shared view."""
+    return qpane_view.presenter
+
+
+@pytest.fixture()
+def qpane_viewport(qpane_view):
+    """Provide the view-managed viewport for convenience in tests."""
+    return qpane_view.viewport
+
+
+@pytest.fixture()
+def qpane_renderer(qpane_view):
+    """Provide the view-managed renderer for rendering tests."""
+    return qpane_view.renderer
+
+
+@pytest.fixture()
+def catalog(qpane_core: QPane):
+    """Expose the Catalog attached to the shared qpane."""
+    return qpane_core.catalog()
+
+
+@pytest.fixture()
+def mask_workflow(qpane_core: QPane):
+    """Expose the Masks workflow to encourage workflow-centric tests."""
+    return qpane_core._masks_controller
+
+
+@pytest.fixture()
+def mask_service(mask_workflow):
+    """Return the attached MaskService when mask tooling is installed."""
+    service = mask_workflow.mask_service()
+    return service
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _redirect_mask_autosave_paths(tmp_path_factory):
+    """Keep mask autosave outputs inside a temporary directory during tests."""
+    autosave_dir = tmp_path_factory.mktemp("mask-autosave")
+    template = str(Path(autosave_dir) / "{image_name}-{mask_id}.png")
+    defaults = config._DEFAULTS
+    original_default = defaults["mask_autosave_path_template"]
+    defaults["mask_autosave_path_template"] = template
+    try:
+        yield
+    finally:
+        defaults["mask_autosave_path_template"] = original_default
