@@ -44,6 +44,7 @@ jobs:
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@github.com"
+          python -m semantic_release -v changelog
           python -m semantic_release -v version --skip-build
 
       - name: Capture released version
