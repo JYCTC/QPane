@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.1 (2026-01-04)
+
+### Fixes
+- Key tiles, pyramids, and SAM predictor caches by image UUID to avoid pathless collisions
+- Guard worker signal emissions during teardown to avoid spurious runtime errors
+
 ## v1.1.0 (2026-01-02)
 
 ### Features
