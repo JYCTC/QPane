@@ -58,7 +58,7 @@ def test_generate_mask_emits_none_when_predictor_missing():
         lambda mask, bbox, erase: captured.append((mask, bbox.copy(), erase))
     )
     bbox = np.array([0, 0, 10, 10])
-    manager.generateMaskFromBox(Path("missing.png"), bbox, erase_mode=False)
+    manager.generateMaskFromBox(uuid.uuid4(), bbox, erase_mode=False)
     assert captured, "maskReady should fire even when the predictor is absent"
     emitted_mask, emitted_bbox, emitted_erase = captured[-1]
     assert emitted_mask is None
@@ -68,8 +68,8 @@ def test_generate_mask_emits_none_when_predictor_missing():
 
 def test_generate_mask_emits_none_when_service_returns_none(monkeypatch):
     manager = SamManager(executor=StubExecutor(), checkpoint_path=DEFAULT_CHECKPOINT)
-    path = Path("existing.png")
-    manager._sam_predictors[path] = object()
+    image_id = uuid.uuid4()
+    manager._sam_predictors[image_id] = object()
     monkeypatch.setattr(
         sam.service,
         "predict_mask_from_box",
@@ -80,7 +80,7 @@ def test_generate_mask_emits_none_when_service_returns_none(monkeypatch):
         lambda mask, bbox, erase: captured.append((mask, bbox.copy(), erase))
     )
     bbox = np.array([1, 2, 3, 4])
-    manager.generateMaskFromBox(path, bbox, erase_mode=True)
+    manager.generateMaskFromBox(image_id, bbox, erase_mode=True)
     assert captured, "maskReady should fire when SAM returns no mask"
     emitted_mask, emitted_bbox, emitted_erase = captured[-1]
     assert emitted_mask is None
@@ -90,13 +90,13 @@ def test_generate_mask_emits_none_when_service_returns_none(monkeypatch):
 
 def test_worker_error_emits_failure_signal():
     manager = SamManager(executor=StubExecutor(), checkpoint_path=DEFAULT_CHECKPOINT)
-    failures: list[tuple[Path, str]] = []
+    failures: list[tuple[uuid.UUID, str]] = []
     manager.predictorLoadFailed.connect(
         lambda path, message: failures.append((path, message))
     )
-    failing_path = Path("broken.png")
-    manager._on_worker_error(failing_path, "boom")
-    assert failures == [(failing_path, "boom")]
+    image_id = uuid.uuid4()
+    manager._on_worker_error(image_id, "boom")
+    assert failures == [(image_id, "boom")]
 
 
 @pytest.mark.usefixtures("qapp")
@@ -133,20 +133,20 @@ def test_mask_controller_handles_none_mask():
 
 def test_generate_mask_emits_none_on_invalid_bbox(caplog):
     manager = SamManager(executor=StubExecutor(), checkpoint_path=DEFAULT_CHECKPOINT)
-    path = Path("invalid.png")
+    image_id = uuid.uuid4()
 
     class _Predictor:
         def predict(self, *, box, multimask_output):
             raise AssertionError("predict should not run for invalid bbox")
 
-    manager._sam_predictors[path] = _Predictor()
+    manager._sam_predictors[image_id] = _Predictor()
     captured: list[tuple[object, np.ndarray, bool]] = []
     manager.maskReady.connect(
         lambda mask, bbox, erase: captured.append((mask, bbox.copy(), erase))
     )
     caplog.set_level(logging.WARNING)
     invalid_bbox = np.array([0, 1, 2])
-    manager.generateMaskFromBox(path, invalid_bbox, erase_mode=True)
+    manager.generateMaskFromBox(image_id, invalid_bbox, erase_mode=True)
     assert captured, "maskReady should emit when SAM rejects a bbox"
     emitted_mask, emitted_bbox, emitted_erase = captured[-1]
     assert emitted_mask is None
@@ -176,14 +176,15 @@ def test_requestPredictor_queues_executor(monkeypatch, qapp, tmp_path):
     )
     image = QImage(8, 8, QImage.Format_ARGB32)
     image.fill(QColor("white"))
-    path = Path("sam-image.png")
-    manager.requestPredictor(image, path)
+    image_id = uuid.uuid4()
+    source_path = Path("sam-image.png")
+    manager.requestPredictor(image, image_id, source_path=source_path)
     pending = list(executor.pending_tasks())
     assert pending and pending[0].handle.category == "sam"
     executor.run_task(pending[0].handle.task_id)
     qapp.processEvents()
     assert executor.finished
-    assert manager.getPredictor(path) is not None
+    assert manager.getPredictor(image_id) is not None
     manager.shutdown()
 
 
@@ -199,13 +200,14 @@ def test_cancel_pending_predictor_requests_executor_cancellation(monkeypatch, tm
     )
     image = QImage(4, 4, QImage.Format_ARGB32)
     image.fill(QColor("black"))
-    path = Path("cancel-me.png")
-    manager.requestPredictor(image, path)
+    image_id = uuid.uuid4()
+    source_path = Path("cancel-me.png")
+    manager.requestPredictor(image, image_id, source_path=source_path)
     pending = list(executor.pending_tasks())
     handle = pending[0].handle
-    manager.cancelPendingPredictor(path)
+    manager.cancelPendingPredictor(image_id)
     assert handle in executor.cancelled
-    assert path not in manager._inflight
+    assert image_id not in manager._inflight
     manager.shutdown()
 
 
@@ -229,13 +231,14 @@ def test_requestPredictor_retries_after_throttle(monkeypatch, qapp, tmp_path) ->
     )
     image = QImage(16, 16, QImage.Format_ARGB32)
     image.fill(QColor("white"))
-    path = Path("sam-throttle.png")
-    throttled: list[tuple[Path, int]] = []
+    image_id = uuid.uuid4()
+    source_path = Path("sam-throttle.png")
+    throttled: list[tuple[uuid.UUID, int]] = []
     manager.predictorThrottled.connect(
         lambda p, attempt: throttled.append((p, attempt))
     )
-    manager.requestPredictor(image, path)
-    assert throttled == [(path, 1)]
+    manager.requestPredictor(image, image_id, source_path=source_path)
+    assert throttled == [(image_id, 1)]
     assert executor.rejections
 
     def wait_for(predicate, *, timeout: float = 1.0) -> None:
@@ -255,7 +258,7 @@ def test_requestPredictor_retries_after_throttle(monkeypatch, qapp, tmp_path) ->
     pending = list(executor.pending_tasks())
     assert pending
     executor.run_task(pending[0].handle.task_id)
-    wait_for(lambda: manager.getPredictor(path) is not None)
+    wait_for(lambda: manager.getPredictor(image_id) is not None)
     assert not getattr(
         manager, "_predictor_retry_entries", {}
     ), "sam retries should be cleared"
@@ -263,10 +266,10 @@ def test_requestPredictor_retries_after_throttle(monkeypatch, qapp, tmp_path) ->
 
 def test_setCacheLimit_trims_existing_predictors(qapp):  # noqa: ANN001
     manager = SamManager(executor=StubExecutor(), checkpoint_path=DEFAULT_CHECKPOINT)
-    removed: list[Path] = []
+    removed: list[uuid.UUID] = []
     manager.predictorRemoved.connect(lambda path: removed.append(path))
-    first = Path("one.png")
-    second = Path("two.png")
+    first = uuid.uuid4()
+    second = uuid.uuid4()
     manager._sam_predictors[first] = object()
     manager._sam_predictors[second] = object()
     manager.setCacheLimit(1)
@@ -280,17 +283,19 @@ def test_cache_limit_enforced_on_predictor_ready(qapp):  # noqa: ANN001
         executor=StubExecutor(),
         checkpoint_path=DEFAULT_CHECKPOINT,
     )
-    removed: list[Path] = []
+    removed: list[uuid.UUID] = []
     manager.predictorRemoved.connect(lambda path: removed.append(path))
-    manager._on_worker_finished(object(), Path("first.png"))
-    manager._on_worker_finished(object(), Path("second.png"))
-    assert removed == [Path("first.png")]
-    assert list(manager._sam_predictors.keys()) == [Path("second.png")]
+    first = uuid.uuid4()
+    second = uuid.uuid4()
+    manager._on_worker_finished(object(), first)
+    manager._on_worker_finished(object(), second)
+    assert removed == [first]
+    assert list(manager._sam_predictors.keys()) == [second]
 
 
 def test_snapshot_metrics_report_cache_bytes():
     manager = SamManager(executor=StubExecutor(), checkpoint_path=DEFAULT_CHECKPOINT)
-    path = Path("bytes.png")
+    image_id = uuid.uuid4()
 
     class _Tensor:
         def __init__(self, numel, element_size):
@@ -318,11 +323,11 @@ def test_snapshot_metrics_report_cache_bytes():
         def __init__(self):
             self.model = _Model()
 
-    manager._on_worker_finished(_Predictor(), path)
+    manager._on_worker_finished(_Predictor(), image_id)
     metrics = manager.snapshot_metrics()
     assert metrics.cache_bytes == 16
     assert manager.cache_usage_bytes() == 16
-    manager.removeFromCache(path)
+    manager.removeFromCache(image_id)
     assert manager.cache_usage_bytes() == 0
 
 
@@ -334,7 +339,7 @@ def test_requestPredictor_logs_when_checkpoint_missing(caplog, tmp_path):
     image = QImage(4, 4, QImage.Format_ARGB32)
     image.fill(QColor("black"))
     caplog.set_level(logging.WARNING)
-    manager.requestPredictor(image, Path("nope.png"))
+    manager.requestPredictor(image, uuid.uuid4(), source_path=Path("nope.png"))
     assert not list(executor.pending_tasks())
     assert "checkpoint is missing" in caplog.text
 
@@ -344,14 +349,15 @@ def test_requestPredictor_emits_ready_on_cache_hit(tmp_path) -> None:
     executor = StubExecutor()
     checkpoint = _touch_checkpoint(tmp_path / "sam-checkpoint.pt")
     manager = SamManager(executor=executor, checkpoint_path=checkpoint)
-    path = Path("cached.png")
+    image_id = uuid.uuid4()
+    source_path = Path("cached.png")
     predictor = object()
-    manager._sam_predictors[path] = predictor
-    captured: list[tuple[object, Path]] = []
+    manager._sam_predictors[image_id] = predictor
+    captured: list[tuple[object, uuid.UUID]] = []
     manager.predictorReady.connect(lambda pred, p: captured.append((pred, p)))
     image = QImage(2, 2, QImage.Format_ARGB32)
-    manager.requestPredictor(image, path)
-    assert captured == [(predictor, path)]
+    manager.requestPredictor(image, image_id, source_path=source_path)
+    assert captured == [(predictor, image_id)]
     assert not list(executor.pending_tasks())
 
 
@@ -361,9 +367,10 @@ def test_requestPredictor_skips_duplicate_inflight(tmp_path) -> None:
     checkpoint = _touch_checkpoint(tmp_path / "sam-checkpoint.pt")
     manager = SamManager(executor=executor, checkpoint_path=checkpoint)
     image = QImage(2, 2, QImage.Format_ARGB32)
-    path = Path("dupe.png")
-    manager.requestPredictor(image, path)
-    manager.requestPredictor(image, path)
+    image_id = uuid.uuid4()
+    source_path = Path("dupe.png")
+    manager.requestPredictor(image, image_id, source_path=source_path)
+    manager.requestPredictor(image, image_id, source_path=source_path)
     pending = list(executor.pending_tasks())
     assert len(pending) == 1
 
@@ -409,12 +416,12 @@ def test_enforce_cache_limit_trims_oldest_entry(tmp_path) -> None:
         executor=StubExecutor(),
         checkpoint_path=_touch_checkpoint(tmp_path / "sam-checkpoint.pt"),
     )
-    first = Path("oldest.png")
-    second = Path("newest.png")
+    first = uuid.uuid4()
+    second = uuid.uuid4()
     manager._sam_predictors = {first: object(), second: object()}
     manager._predictor_sizes = {first: 10, second: 10}
     manager._pending_estimates = {first: 10, second: 10}
-    removed: list[Path] = []
+    removed: list[uuid.UUID] = []
     manager.predictorRemoved.connect(lambda path: removed.append(path))
     manager.setCacheLimit(1)
     assert removed == [first]
@@ -456,17 +463,17 @@ def test_drop_predictor_removes_sizes_and_estimates(tmp_path) -> None:
         executor=StubExecutor(),
         checkpoint_path=_touch_checkpoint(tmp_path / "sam-checkpoint.pt"),
     )
-    path = Path("drop.png")
-    manager._sam_predictors[path] = object()
-    manager._predictor_sizes[path] = 12
-    manager._pending_estimates[path] = 7
-    removed: list[Path] = []
-    manager.predictorRemoved.connect(lambda removed_path: removed.append(removed_path))
-    assert manager._drop_predictor(path) is True
-    assert removed == [path]
-    assert path not in manager._sam_predictors
-    assert path not in manager._predictor_sizes
-    assert path not in manager._pending_estimates
+    image_id = uuid.uuid4()
+    manager._sam_predictors[image_id] = object()
+    manager._predictor_sizes[image_id] = 12
+    manager._pending_estimates[image_id] = 7
+    removed: list[uuid.UUID] = []
+    manager.predictorRemoved.connect(lambda removed_id: removed.append(removed_id))
+    assert manager._drop_predictor(image_id) is True
+    assert removed == [image_id]
+    assert image_id not in manager._sam_predictors
+    assert image_id not in manager._predictor_sizes
+    assert image_id not in manager._pending_estimates
 
 
 def test_measure_predictor_bytes_returns_zero_without_model(tmp_path) -> None:

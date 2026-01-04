@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import uuid
 
 import pytest
 
@@ -112,7 +112,7 @@ def test_sam_predictor_consumer_trims_and_updates_usage() -> None:
 
     class _ManagerStub:
         def __init__(self) -> None:
-            self._paths = [Path("a"), Path("b")]
+            self._image_ids = [uuid.uuid4(), uuid.uuid4()]
             self._usage = 10
 
         def cache_usage_bytes(self) -> int:
@@ -121,20 +121,22 @@ def test_sam_predictor_consumer_trims_and_updates_usage() -> None:
         def pendingUsageBytes(self) -> int:
             return 0
 
-        def predictorPaths(self):
-            return list(self._paths)
+        def predictorImageIds(self):
+            return list(self._image_ids)
 
-        def removeFromCache(self, path: Path) -> bool:
-            if path in self._paths:
-                self._paths.remove(path)
+        def removeFromCache(self, image_id: uuid.UUID) -> bool:
+            if image_id in self._image_ids:
+                self._image_ids.remove(image_id)
                 self._usage = max(0, self._usage - 5)
                 return True
             return False
 
-        def requestPredictor(self, image, path: Path) -> None:
+        def requestPredictor(
+            self, image, image_id: uuid.UUID, *, source_path=None
+        ) -> None:
             return None
 
-        def cancelPendingPredictor(self, path: Path) -> bool:
+        def cancelPendingPredictor(self, image_id: uuid.UUID) -> bool:
             return False
 
         class _Signal:

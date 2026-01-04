@@ -127,9 +127,18 @@ class SwapDelegate:
         """Ask the coordinator to warm up neighbors for ``image_id``."""
         self._coordinator.prefetch_neighbors(image_id, candidates=candidates)
 
-    def apply_image(self, image, source_path: Path | None, *, fit_view: bool) -> None:
+    def apply_image(
+        self,
+        image,
+        source_path: Path | None,
+        *,
+        image_id: uuid.UUID | None = None,
+        fit_view: bool,
+    ) -> None:
         """Display ``image`` sourced from ``source_path`` via the coordinator."""
-        self._coordinator.apply_image(image, source_path, fit_view=fit_view)
+        self._coordinator.apply_image(
+            image, source_path, image_id=image_id, fit_view=fit_view
+        )
 
     def apply_config(self, config: Config) -> None:
         """Forward configuration changes to the coordinator."""
@@ -154,10 +163,9 @@ class SwapDelegate:
     def handle_tile_ready(self, identifier: TileIdentifier) -> None:
         """Mark the active region dirty when a matching prefetched tile arrives."""
         qpane = self._qpane
-        if (
-            qpane.original_image.isNull()
-            or qpane.currentImagePath != identifier.source_path
-        ):
+        if qpane.original_image.isNull():
+            return
+        if identifier.image_id != qpane.currentImageID():
             return
         render_state = self._rendering.calculateRenderState(
             use_pan=None,
@@ -174,13 +182,13 @@ class SwapDelegate:
         dirty_rect = panel_rect_f.adjusted(-1, -1, 1, 1).toRect()
         self._mark_dirty(dirty_rect)
 
-    def handle_pyramid_ready(self, source_path: Path | None) -> None:
+    def handle_pyramid_ready(self, image_id: uuid.UUID | None) -> None:
         """Trigger a repaint when the active image's pyramid finishes."""
         qpane = self._qpane
-        if source_path and source_path == qpane.currentImagePath:
+        if image_id is not None and image_id == qpane.currentImageID():
             logger.info(
-                "Pyramid ready for current image; scheduling repaint (path=%s)",
-                str(source_path),
+                "Pyramid ready for current image; scheduling repaint (image_id=%s)",
+                image_id,
             )
             qpane.markDirty()
             qpane.update()

@@ -17,6 +17,7 @@
 """Tile generation and caching primitives powered by the shared task executor."""
 
 import logging
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,9 +49,10 @@ _TILE_RETRY_MAX_MS = 1000
 
 
 class TileIdentifier(NamedTuple):
-    """Uniquely identifies a tile by its source, pyramid scale, and grid position."""
+    """Uniquely identifies a tile by image UUID, pyramid scale, and grid position."""
 
-    source_path: Path
+    image_id: uuid.UUID
+    source_path: Path | None
     pyramid_scale: float  # The scale of the pyramid level (e.g., 1.0, 0.5, 0.25)
     row: int
     col: int
@@ -373,11 +375,11 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
             active_workers,
         )
 
-    def remove_tiles_for_path(self, source_path: Path):
-        """Removes all tiles associated with a specific source path.
+    def remove_tiles_for_image_id(self, image_id: uuid.UUID) -> None:
+        """Removes all tiles associated with a specific image ID.
 
         Args:
-            source_path: The Path to remove tiles for.
+            image_id: Identifier to remove tiles for.
 
         Side effects:
             Cancels workers, updates cache/state, emits logs.
@@ -386,7 +388,7 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         ids_to_remove = [
             identifier
             for identifier in self._tile_cache
-            if identifier.source_path == source_path
+            if identifier.image_id == image_id
         ]
         for identifier in ids_to_remove:
             self._remove_tile_locked(identifier)
@@ -394,7 +396,7 @@ class TileManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         worker_ids = [
             identifier
             for identifier in self._worker_state
-            if identifier.source_path == source_path
+            if identifier.image_id == image_id
         ]
         for identifier in worker_ids:
             entry = self._worker_state.pop(identifier, None)

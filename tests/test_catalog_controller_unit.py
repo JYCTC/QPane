@@ -105,11 +105,11 @@ class _TileManagerStub:
     """Track cache removals triggered by catalog mutations."""
 
     def __init__(self) -> None:
-        self.removed: list[str] = []
+        self.removed: list[uuid.UUID] = []
         self.cleared = False
 
-    def remove_tiles_for_path(self, path) -> None:
-        self.removed.append(str(path))
+    def remove_tiles_for_image_id(self, image_id: uuid.UUID) -> None:
+        self.removed.append(image_id)
 
     def clear_caches(self) -> None:
         self.cleared = True
@@ -292,12 +292,12 @@ def test_remove_images_evicts_mask_and_sam_caches() -> None:
     image_id = uuid.uuid4()
     other_id = uuid.uuid4()
     mask_calls: list[uuid.UUID] = []
-    sam_calls: list[str] = []
+    sam_calls: list[uuid.UUID] = []
     mask_service = SimpleNamespace(
         invalidateMaskCachesForImage=lambda mid: mask_calls.append(mid)
     )
     sam_manager = SimpleNamespace(
-        removeFromCache=lambda path: sam_calls.append(str(path))
+        removeFromCache=lambda image_id: sam_calls.append(image_id)
     )
     controller, catalog, tile_manager, link_manager = _make_controller(
         image=QImage(5, 5, QImage.Format_ARGB32),
@@ -311,7 +311,7 @@ def test_remove_images_evicts_mask_and_sam_caches() -> None:
     removed = controller.removeImagesByID((image_id,))
     assert removed == (image_id,)
     assert mask_calls == [image_id]
-    assert tile_manager.removed == ["first.png"]
-    assert sam_calls == ["first.png"]
+    assert tile_manager.removed == [image_id]
+    assert sam_calls == [image_id]
     assert link_manager.removed == [image_id]
     assert controller._swap_delegate.display_calls == 1

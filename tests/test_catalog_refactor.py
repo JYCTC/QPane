@@ -28,19 +28,21 @@ from tests.helpers.executor_stubs import StubExecutor
 
 class StubPyramidManager:
     def __init__(self):
-        self.generated: list[tuple[QImage, Path]] = []
-        self.removed: list[Path | None] = []
+        self.generated: list[tuple[uuid.UUID, QImage, Path | None]] = []
+        self.removed: list[uuid.UUID] = []
         self.cleared = False
         self.apply_calls: list[Config] = []
 
-    def generate_pyramid_for_image(self, image: QImage, path: Path) -> None:
-        self.generated.append((image, path))
+    def generate_pyramid_for_image(
+        self, image_id: uuid.UUID, image: QImage, source_path: Path | None
+    ) -> None:
+        self.generated.append((image_id, image, source_path))
 
     def apply_config(self, config: Config) -> None:
         self.apply_calls.append(config)
 
-    def remove_pyramid(self, path: Path | None) -> None:
-        self.removed.append(path)
+    def remove_pyramid(self, image_id: uuid.UUID) -> None:
+        self.removed.append(image_id)
 
     def clear(self) -> None:
         self.cleared = True
@@ -62,12 +64,13 @@ def test_set_images_normalizes_and_uses_consistent_format(qapp):
             image=_make_image(QImage.Format_RGB32), path=Path("foo.png")
         ),
     }
-    removed_paths, changed_paths = catalog.setImagesByID(image_map, image_id)
+    removed_ids, changed_ids = catalog.setImagesByID(image_map, image_id)
     stored_image = catalog.images_by_id[image_id]
     assert stored_image.format() == QImage.Format_ARGB32_Premultiplied
-    assert removed_paths == set()
-    assert changed_paths == set()
-    generated_image, generated_path = stub.generated[-1]
+    assert removed_ids == set()
+    assert changed_ids == {image_id}
+    generated_id, generated_image, generated_path = stub.generated[-1]
+    assert generated_id == image_id
     assert generated_path == Path("foo.png")
     assert generated_image.format() == QImage.Format_ARGB32_Premultiplied
 
@@ -81,7 +84,8 @@ def test_add_image_normalizes_before_storage_and_pyramid(qapp):
     catalog.addImage(image_id, src_image, Path("bar.png"))
     stored_image = catalog.images_by_id[image_id]
     assert stored_image.format() == QImage.Format_ARGB32_Premultiplied
-    generated_image, generated_path = stub.generated[-1]
+    generated_id, generated_image, generated_path = stub.generated[-1]
+    assert generated_id == image_id
     assert generated_path == Path("bar.png")
     assert generated_image.format() == QImage.Format_ARGB32_Premultiplied
 
@@ -107,8 +111,9 @@ def test_update_current_entry_normalizes_and_refreshes_pyramid(qapp):
     stored_image = catalog.images_by_id[image_id]
     assert stored_image.format() == QImage.Format_ARGB32_Premultiplied
     # ensure the old pyramid was removed and the new one uses normalized data
-    assert stub.removed[-1] == Path("old.png")
-    generated_image, generated_path = stub.generated[-1]
+    assert stub.removed[-1] == image_id
+    generated_id, generated_image, generated_path = stub.generated[-1]
+    assert generated_id == image_id
     assert generated_path == Path("new.png")
     assert generated_image.format() == QImage.Format_ARGB32_Premultiplied
 
@@ -126,7 +131,8 @@ def test_apply_config_regenerates_current_image(qapp):
     catalog.apply_config(updated)
     assert stub.apply_calls[-1] is updated
     assert stub.generated
-    generated_image, generated_path = stub.generated[-1]
+    generated_id, generated_image, generated_path = stub.generated[-1]
+    assert generated_id == image_id
     assert generated_path == path
     assert generated_image.format() == QImage.Format_ARGB32_Premultiplied
 

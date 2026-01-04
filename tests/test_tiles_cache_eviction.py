@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from pathlib import Path
+import uuid
 
 import pytest
 
@@ -34,7 +35,8 @@ def test_allow_cache_insert_honors_guard(caplog):
     manager = TileManager(config=Config(), executor=StubExecutor())
     manager.cache_limit_bytes = 100
     manager.set_admission_guard(lambda _size: False)
-    key = TileIdentifier(Path("a.png"), 1.0, 0, 0)
+    image_id = uuid.uuid4()
+    key = TileIdentifier(image_id, Path("a.png"), 1.0, 0, 0)
     caplog.set_level("WARNING")
     assert manager._allow_cache_insert(50, key) is False
     assert manager._allow_cache_insert(50, key) is False
@@ -62,7 +64,8 @@ def test_schedule_cache_eviction_requires_executor():
 def test_evict_cache_batch_drops_entries():
     """Eviction should remove cached tiles and update bytes."""
     manager = TileManager(config=Config(), executor=StubExecutor())
-    key = TileIdentifier(Path("a.png"), 1.0, 0, 0)
+    image_id = uuid.uuid4()
+    key = TileIdentifier(image_id, Path("a.png"), 1.0, 0, 0)
     manager.cache_limit_bytes = 0
     manager._tile_cache = OrderedDict({key: type("Tile", (), {"size_bytes": 5})()})
     manager._cache_size_bytes = 5

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import time
 import logging
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 import pytest
@@ -133,7 +134,8 @@ def test_tile_guard_rejects_oversized_item(caplog: pytest.LogCaptureFixture) -> 
     )
     executor = StubExecutor()
     manager = TileManager(config=config, executor=executor)
-    tile = _make_tile(TileIdentifier(Path("oversize.png"), 1.0, 0, 0))
+    image_id = uuid.uuid4()
+    tile = _make_tile(TileIdentifier(image_id, Path("oversize.png"), 1.0, 0, 0))
     with caplog.at_level(logging.WARNING):
         manager.add_tile(tile)
         manager.add_tile(tile)
@@ -161,8 +163,9 @@ def test_tile_guard_blocks_when_hard_cap_already_over_budget(
         assert coordinator is not None
         tile_manager = qpane_widget.view().tile_manager
         coordinator.update_usage("tiles", int(0.9 * MB))
+        image_id = uuid.uuid4()
         small_tile = _make_tile(
-            TileIdentifier(Path("over-cap.png"), 1.0, 0, 0), side=256
+            TileIdentifier(image_id, Path("over-cap.png"), 1.0, 0, 0), side=256
         )
         guard_result = coordinator.should_admit(small_tile.size_bytes)
         assert (
@@ -188,8 +191,11 @@ def test_tile_manager_eviction_uses_maintenance_executor_lane(
     config = Config(cache={"tiles": {"mb": 1}})
     executor = ImmediateStubExecutor()
     manager = TileManager(config=config, executor=executor)
-    tile = _make_tile(TileIdentifier(Path("a.png"), 1.0, 0, 0), side=512)
-    overflow = _make_tile(TileIdentifier(Path("a-over.png"), 1.0, 0, 1), side=512)
+    image_id = uuid.uuid4()
+    tile = _make_tile(TileIdentifier(image_id, Path("a.png"), 1.0, 0, 0), side=512)
+    overflow = _make_tile(
+        TileIdentifier(image_id, Path("a-over.png"), 1.0, 0, 1), side=512
+    )
     manager.add_tile(tile)
     manager.add_tile(overflow)
     assert executor.pending_categories() == ["maintenance"]
@@ -206,8 +212,13 @@ def test_tile_manager_coalesces_pending_eviction_requests(
     config = Config(cache={"tiles": {"mb": 1}})
     executor = ImmediateStubExecutor()
     manager = TileManager(config=config, executor=executor)
-    first_tile = _make_tile(TileIdentifier(Path("b.png"), 1.0, 0, 0), side=512)
-    second_tile = _make_tile(TileIdentifier(Path("c.png"), 1.0, 0, 1), side=512)
+    image_id = uuid.uuid4()
+    first_tile = _make_tile(
+        TileIdentifier(image_id, Path("b.png"), 1.0, 0, 0), side=512
+    )
+    second_tile = _make_tile(
+        TileIdentifier(image_id, Path("c.png"), 1.0, 0, 1), side=512
+    )
     manager.add_tile(first_tile)
     manager.add_tile(second_tile)
     assert executor.pending_categories() == ["maintenance"]
@@ -224,8 +235,9 @@ def test_tile_manager_recovers_after_budget_increase(
     low_config = Config(cache={"tiles": {"mb": 1}})
     executor = ImmediateStubExecutor()
     manager = TileManager(config=low_config, executor=executor)
-    tile = _make_tile(TileIdentifier(Path("d.png"), 1.0, 0, 0), side=512)
-    overflow = _make_tile(TileIdentifier(Path("e.png"), 1.0, 0, 1), side=512)
+    image_id = uuid.uuid4()
+    tile = _make_tile(TileIdentifier(image_id, Path("d.png"), 1.0, 0, 0), side=512)
+    overflow = _make_tile(TileIdentifier(image_id, Path("e.png"), 1.0, 0, 1), side=512)
     manager.add_tile(tile)
     manager.add_tile(overflow)
     assert executor.pending_categories() == ["maintenance"]
@@ -252,7 +264,8 @@ def test_get_tile_queues_executor_and_populates_cache(qapp) -> None:
     manager = TileManager(config=config, executor=executor)
     source_image = QImage(128, 128, QImage.Format_ARGB32)
     source_image.fill(0)
-    identifier = TileIdentifier(Path("z.png"), 1.0, 0, 0)
+    image_id = uuid.uuid4()
+    identifier = TileIdentifier(image_id, Path("z.png"), 1.0, 0, 0)
     result = manager.get_tile(identifier, source_image)
     assert result is None
     pending = list(executor.pending_tasks())
@@ -293,7 +306,8 @@ def test_tile_manager_retries_after_throttle(qapp) -> None:
     manager = TileManager(config=config, executor=executor)
     source_image = QImage(128, 128, QImage.Format_ARGB32)
     source_image.fill(0)
-    identifier = TileIdentifier(Path("retry.png"), 1.0, 0, 0)
+    image_id = uuid.uuid4()
+    identifier = TileIdentifier(image_id, Path("retry.png"), 1.0, 0, 0)
     throttled: list[tuple[TileIdentifier, int]] = []
     manager.tilesThrottled.connect(
         lambda ident, attempt: throttled.append((ident, attempt))
@@ -328,7 +342,8 @@ def test_tile_manager_retries_after_throttle(qapp) -> None:
 def test_prefetch_tiles_counts_cache_hits(qapp):
     manager = TileManager(config=Config(), executor=StubExecutor())
     source_image = QImage(64, 64, QImage.Format_ARGB32)
-    identifier = TileIdentifier(Path("cache-hit.png"), 1.0, 0, 0)
+    image_id = uuid.uuid4()
+    identifier = TileIdentifier(image_id, Path("cache-hit.png"), 1.0, 0, 0)
     tile = Tile(identifier=identifier, image=source_image.copy())
     manager.add_tile(tile)
     scheduled = manager.prefetch_tiles([identifier], source_image)
@@ -345,7 +360,8 @@ def test_prefetch_tiles_handles_throttled_requests(qapp):
     manager = TileManager(config=config, executor=executor)
     source_image = QImage(64, 64, QImage.Format_ARGB32)
     source_image.fill(0)
-    identifier = TileIdentifier(Path("throttled.png"), 1.0, 0, 0)
+    image_id = uuid.uuid4()
+    identifier = TileIdentifier(image_id, Path("throttled.png"), 1.0, 0, 0)
     scheduled = manager.prefetch_tiles([identifier], source_image)
     assert scheduled == [identifier]
     assert manager._prefetch_pending(identifier)
@@ -382,7 +398,8 @@ class _DummyWorker:
 def test_cancel_prefetch_updates_metrics(qapp):
     manager = TileManager(config=Config(), executor=StubExecutor())
     manager._executor = _DummyExecutor()
-    identifier = TileIdentifier(Path("prefetch-cancel.png"), 1.0, 0, 0)
+    image_id = uuid.uuid4()
+    identifier = TileIdentifier(image_id, Path("prefetch-cancel.png"), 1.0, 0, 0)
     manager._worker_state[identifier] = {
         "worker": _DummyWorker(),
         "handle": object(),

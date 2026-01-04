@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+import uuid
 from typing import Any, Callable
 
 from .coordinator import CacheConsumerCallbacks, CacheCoordinator, CachePriority
@@ -238,7 +238,7 @@ class SamPredictorCacheConsumer:
                 exc_info=True,
             )
 
-    def _on_predictor_ready(self, predictor, path):  # noqa: ANN001
+    def _on_predictor_ready(self, predictor, image_id):  # noqa: ANN001
         """Record predictor estimates once the manager signals readiness."""
         self._notify()
 
@@ -246,7 +246,7 @@ class SamPredictorCacheConsumer:
         """Reset predictor accounting when the manager clears its cache."""
         self._coordinator.update_usage(self._consumer_id, 0)
 
-    def _on_predictor_removed(self, path: Path) -> None:
+    def _on_predictor_removed(self, image_id: uuid.UUID) -> None:
         """Drop bookkeeping for predictors removed externally (e.g., limit trims)."""
         self._notify()
 
@@ -294,16 +294,16 @@ class SamPredictorCacheConsumer:
                 "SAM predictor manager missing removeFromCache; cannot enforce trims"
             )
             raise RuntimeError("removeFromCache missing for SAM cache consumer")
-        path_accessor = getattr(self._manager, "predictorPaths", None)
-        if not callable(path_accessor):
+        id_accessor = getattr(self._manager, "predictorImageIds", None)
+        if not callable(id_accessor):
             logger.error(
-                "SAM predictor manager missing predictorPaths; cannot enumerate cache keys"
+                "SAM predictor manager missing predictorImageIds; cannot enumerate cache keys"
             )
-            raise RuntimeError("predictorPaths missing for SAM cache consumer")
-        for path in path_accessor():
+            raise RuntimeError("predictorImageIds missing for SAM cache consumer")
+        for image_id in id_accessor():
             if usage <= target:
                 break
-            if drop(path):
+            if drop(image_id):
                 usage = self._get_usage()
         usage = max(usage, 0)
         if usage > target:

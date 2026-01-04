@@ -21,7 +21,6 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt
@@ -160,7 +159,14 @@ def _assert_view_alignment(qpane: QPane) -> None:
 def _assert_view_handles_tile_ready(qpane: QPane, monkeypatch) -> None:
     """Verify tile-ready callbacks delegate to the swap layer."""
     view = qpane.view()
-    sentinel = TileIdentifier(source_path=None, pyramid_scale=1.0, row=0, col=0)
+    image_id = uuid.uuid4()
+    sentinel = TileIdentifier(
+        image_id=image_id,
+        source_path=None,
+        pyramid_scale=1.0,
+        row=0,
+        col=0,
+    )
     calls: list[TileIdentifier] = []
     monkeypatch.setattr(view.swap_delegate, "handle_tile_ready", calls.append)
     view.handle_tile_ready(sentinel)
@@ -170,8 +176,8 @@ def _assert_view_handles_tile_ready(qpane: QPane, monkeypatch) -> None:
 def _assert_view_handles_pyramid_ready(qpane: QPane, monkeypatch) -> None:
     """Verify pyramid-ready callbacks delegate to the swap layer."""
     view = qpane.view()
-    sentinel = Path("/tmp/test.png")
-    calls: list[Path | None] = []
+    sentinel = uuid.uuid4()
+    calls: list[uuid.UUID | None] = []
     monkeypatch.setattr(view.swap_delegate, "handle_pyramid_ready", calls.append)
     view.handle_pyramid_ready(sentinel)
     assert calls == [sentinel]
@@ -475,7 +481,14 @@ def _assert_apply_settings_clears_tile_cache(
 ) -> None:
     """Changing tile size should flush tile cache and worker metadata."""
     tile_manager = qpane.view().tile_manager
-    identifier = TileIdentifier(tmp_path / "image.png", 1.0, 0, 0)
+    image_id = uuid.uuid4()
+    identifier = TileIdentifier(
+        image_id,
+        tmp_path / "image.png",
+        1.0,
+        0,
+        0,
+    )
     tile_manager._tile_cache[identifier] = Tile(identifier=identifier, image=QImage())
     tile_manager._cache_size_bytes = 128
     tile_manager._worker_state[identifier] = {"worker": None, "handle": None}
@@ -738,7 +751,10 @@ def _assert_swap_apply_image_realigns_view(qpane: QPane, monkeypatch, tmp_path) 
 
     monkeypatch.setattr(presenter, "ensure_view_alignment", fake_align)
     qpane.view().swap_delegate.apply_image(
-        _solid_image(16, 16), tmp_path / "swap.png", fit_view=True
+        _solid_image(16, 16),
+        tmp_path / "swap.png",
+        image_id=uuid.uuid4(),
+        fit_view=True,
     )
     assert calls and calls[-1] is True
 

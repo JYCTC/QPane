@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 class ImageCatalog(QObject):
     """Qt-backed data model tracking catalog images, paths, masks, and pyramids."""
 
-    pyramidReady = Signal(Path)
+    pyramidReady = Signal(uuid.UUID)
 
     def __init__(
         self,
@@ -83,8 +83,8 @@ class ImageCatalog(QObject):
             return
         image = self.images_by_id.get(current_id)
         path = self.paths_by_id.get(current_id)
-        if path is not None and image is not None and not image.isNull():
-            self.pyramid_manager.generate_pyramid_for_image(image, path)
+        if image is not None and not image.isNull():
+            self.pyramid_manager.generate_pyramid_for_image(current_id, image, path)
 
     def set_mask_manager(self, mask_manager: "MaskManager" | None) -> None:
         """Assign or replace the mask manager backend.
@@ -98,7 +98,7 @@ class ImageCatalog(QObject):
         self,
         image_map: ImageMap,
         current_id: uuid.UUID,
-    ) -> tuple[Set[Path], Set[Path]]:
+    ) -> tuple[Set[uuid.UUID], Set[uuid.UUID]]:
         """Replace the entire catalog while keeping pyramids and masks in sync.
 
         Args:
@@ -106,8 +106,8 @@ class ImageCatalog(QObject):
             current_id: Identifier that should become the current selection.
 
         Returns:
-            Paths whose pyramids were removed and paths whose content changed but
-            kept the same identifier.
+            Image IDs whose pyramids were removed and IDs whose content changed
+            but kept the same identifier.
 
         Raises:
             ValueError: If ``image_map`` is empty.
@@ -136,36 +136,27 @@ class ImageCatalog(QObject):
         for iid in ids_to_remove:
             if mask_manager:
                 mask_manager.handle_image_removal(iid)
-        old_paths = set(p for p in self.paths_by_id.values() if p is not None)
-        new_paths = set(
-            entry.path for entry in image_map.values() if entry.path is not None
-        )
-        paths_to_remove = old_paths - new_paths
-        for path in paths_to_remove:
-            self.pyramid_manager.remove_pyramid(path)
-        unchanged_or_new_paths = new_paths & old_paths
-        paths_with_changed_content: Set[Path] = set()
+        ids_with_changed_content: Set[uuid.UUID] = set()
         for iid, entry in image_map.items():
-            p = entry.path
-            if p is None or p not in unchanged_or_new_paths:
-                continue
             existing_image = self.images_by_id.get(iid)
-            if not images_differ(existing_image, formatted[iid]):
+            if images_differ(existing_image, formatted[iid]):
+                ids_with_changed_content.add(iid)
+        for iid in ids_to_remove:
+            self.pyramid_manager.remove_pyramid(iid)
+        for iid in ids_with_changed_content:
+            self.pyramid_manager.remove_pyramid(iid)
+        for iid in image_map.keys():
+            image = formatted[iid]
+            if image.isNull():
                 continue
-            self.pyramid_manager.remove_pyramid(p)
-            paths_with_changed_content.add(p)
-        paths_to_add = new_paths - old_paths
-        for iid, entry in image_map.items():
-            p = entry.path
-            if p is not None and p in paths_to_add:
-                self.pyramid_manager.generate_pyramid_for_image(formatted[iid], p)
-            elif p is not None and p in paths_with_changed_content:
-                self.pyramid_manager.generate_pyramid_for_image(formatted[iid], p)
+            self.pyramid_manager.generate_pyramid_for_image(
+                iid, image, image_map[iid].path
+            )
         self.image_ids = list(image_map.keys())
         self.images_by_id = {iid: formatted[iid] for iid in self.image_ids}
         self.paths_by_id = {iid: image_map[iid].path for iid in self.image_ids}
         self.current_id = current_id
-        return paths_to_remove, paths_with_changed_content
+        return ids_to_remove, ids_with_changed_content
 
     def addImage(
         self,
@@ -191,27 +182,10 @@ class ImageCatalog(QObject):
             logger.error("addImage called with null QImage for %s", image_id)
             raise ValueError("image must not be null")
         formatted_image = self._ensureArgb32(image)
-        existing_path = self.paths_by_id.get(image_id)
         existing_image = self.images_by_id.get(image_id)
-        if (
-            existing_path is not None
-            and existing_path != path
-            and not any(
-                p == existing_path
-                for iid, p in self.paths_by_id.items()
-                if iid != image_id
-            )
-        ):
-            self.pyramid_manager.remove_pyramid(existing_path)
-        if path and path not in self.paths_by_id.values():
-            self.pyramid_manager.generate_pyramid_for_image(formatted_image, path)
-        elif (
-            path
-            and existing_path == path
-            and images_differ(existing_image, formatted_image)
-        ):
-            self.pyramid_manager.remove_pyramid(path)
-            self.pyramid_manager.generate_pyramid_for_image(formatted_image, path)
+        if images_differ(existing_image, formatted_image):
+            self.pyramid_manager.remove_pyramid(image_id)
+        self.pyramid_manager.generate_pyramid_for_image(image_id, formatted_image, path)
         if image_id not in self.image_ids:
             self.image_ids.append(image_id)
         self.images_by_id[image_id] = formatted_image
@@ -253,14 +227,15 @@ class ImageCatalog(QObject):
         content_changed = False
         if old_path != path:
             content_changed = True
-            if old_path is not None:
-                self.pyramid_manager.remove_pyramid(old_path)
+            self.pyramid_manager.remove_pyramid(current_id)
             if (
                 path is not None
                 and reference_image is not None
                 and not reference_image.isNull()
             ):
-                self.pyramid_manager.generate_pyramid_for_image(reference_image, path)
+                self.pyramid_manager.generate_pyramid_for_image(
+                    current_id, reference_image, path
+                )
         elif (
             path is not None
             and reference_image is not None
@@ -268,8 +243,10 @@ class ImageCatalog(QObject):
         ):
             existing_image = previous_image
             if images_differ(existing_image, reference_image):
-                self.pyramid_manager.remove_pyramid(path)
-                self.pyramid_manager.generate_pyramid_for_image(reference_image, path)
+                self.pyramid_manager.remove_pyramid(current_id)
+                self.pyramid_manager.generate_pyramid_for_image(
+                    current_id, reference_image, path
+                )
                 content_changed = True
         if current_id in self.paths_by_id or path is not None:
             self.paths_by_id[current_id] = path
@@ -291,8 +268,7 @@ class ImageCatalog(QObject):
         if image_id not in self.images_by_id:
             raise KeyError("image_id not found")
         # Pyramid and mask cleanup
-        path_to_remove = self.paths_by_id.get(image_id)
-        self.pyramid_manager.remove_pyramid(path_to_remove)
+        self.pyramid_manager.remove_pyramid(image_id)
         if self.mask_manager:
             self.mask_manager.handle_image_removal(image_id)
         # Remove from stores
@@ -379,17 +355,21 @@ class ImageCatalog(QObject):
         """Return filesystem paths aligned with :meth:`getAllImages`."""
         return [self.paths_by_id.get(iid) for iid in self.image_ids]
 
-    def getBestFitImage(self, source_path: Path, target_width: float) -> QImage | None:
+    def getBestFitImage(
+        self, image_id: uuid.UUID | None, target_width: float
+    ) -> QImage | None:
         """Retrieve the best-fit pyramid image for the requested width.
 
         Args:
-            source_path: Path that identifies the pyramid to query.
+            image_id: Image ID that identifies the pyramid to query.
             target_width: Desired width in device pixels.
 
         Returns:
             Approximated image level or ``None`` when unavailable.
         """
-        return self.pyramid_manager.get_best_fit_image(source_path, target_width)
+        if image_id is None:
+            return None
+        return self.pyramid_manager.get_best_fit_image(image_id, target_width)
 
     def _ensureArgb32(self, image: QImage) -> QImage:
         """Return a QImage in ARGB32_Premultiplied format; gracefully handle null images."""

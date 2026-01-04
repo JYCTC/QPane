@@ -92,14 +92,16 @@ class RecordingSamManager:
     """Stub SAM manager that remembers predictor lifecycle events."""
 
     def __init__(self) -> None:
-        self.requested: list[Path] = []
-        self.cancelled: list[Path] = []
+        self.requested: list[uuid.UUID] = []
+        self.cancelled: list[uuid.UUID] = []
 
-    def requestPredictor(self, _image: QImage, path: Path) -> None:
-        self.requested.append(path)
+    def requestPredictor(
+        self, _image: QImage, image_id: uuid.UUID, *, source_path: Path | None
+    ) -> None:
+        self.requested.append(image_id)
 
-    def cancelPendingPredictor(self, path: Path) -> bool:
-        self.cancelled.append(path)
+    def cancelPendingPredictor(self, image_id: uuid.UUID) -> bool:
+        self.cancelled.append(image_id)
         return True
 
 
@@ -146,7 +148,7 @@ class StubTileManager:
         self.tileReady = DummySignal()
         self.prefetch_calls: list[tuple[tuple[TileIdentifier, ...], str]] = []
         self.cancel_calls: list[tuple[tuple[TileIdentifier, ...], str]] = []
-        self.removed_paths: list[Path] = []
+        self.removed_ids: list[uuid.UUID] = []
         self.cache_limit_bytes = 0
         self.cache_usage_bytes = 0
 
@@ -159,8 +161,8 @@ class StubTileManager:
         batch = tuple(identifiers)
         self.cancel_calls.append((batch, reason))
 
-    def remove_tiles_for_path(self, path: Path) -> None:
-        self.removed_paths.append(path)
+    def remove_tiles_for_image_id(self, image_id: uuid.UUID) -> None:
+        self.removed_ids.append(image_id)
 
     def calculate_grid_dimensions(self, width: int, height: int) -> tuple[int, int]:
         cols = max(1, width // 64)
@@ -173,15 +175,21 @@ class StubPyramidManager:
 
     def __init__(self) -> None:
         self.pyramidReady = DummySignal()
-        self.prefetch_calls: list[tuple[Path, str]] = []
-        self.cancel_calls: list[tuple[tuple[Path, ...], str]] = []
+        self.prefetch_calls: list[tuple[uuid.UUID, str]] = []
+        self.cancel_calls: list[tuple[tuple[uuid.UUID, ...], str]] = []
 
-    def prefetch_pyramid(self, image, path: Path, reason: str = "prefetch") -> bool:
-        self.prefetch_calls.append((path, reason))
+    def prefetch_pyramid(
+        self,
+        image_id: uuid.UUID,
+        image: QImage,
+        source_path: Path | None,
+        reason: str = "prefetch",
+    ) -> bool:
+        self.prefetch_calls.append((image_id, reason))
         return True
 
-    def cancel_prefetch(self, paths, *, reason: str) -> None:
-        batch = tuple(paths)
+    def cancel_prefetch(self, image_ids, *, reason: str) -> None:
+        batch = tuple(image_ids)
         self.cancel_calls.append((batch, reason))
 
 
@@ -277,6 +285,9 @@ class StubCatalog:
             return None
         return self._entries[self.current_id].image
 
+    def getCurrentId(self) -> uuid.UUID | None:
+        return self.current_id
+
     def getCurrentPath(self) -> Path | None:
         if self.current_id is None:
             return None
@@ -313,11 +324,9 @@ class StubCatalog:
             changed = True
         return changed
 
-    def getBestFitImage(self, path: Path, target_width: int) -> QImage | None:
-        image_id = self._path_index.get(path)
-        if image_id is None:
-            return None
-        return self._entries[image_id].image
+    def getBestFitImage(self, image_id: uuid.UUID, target_width: int) -> QImage | None:
+        entry = self._entries.get(image_id)
+        return None if entry is None else entry.image
 
     def exitPlaceholderMode(self) -> None:
         return
@@ -474,21 +483,21 @@ def test_set_current_image_cancels_only_irrelevant_work(harness):
     harness.add_image(color=Qt.black, path=path2)
     third_id = harness.add_image(color=Qt.green, path=path3)
     harness.set_current_image(third_id)
-    assert path3 in sam_manager.requested
-    assert path3 in harness.coordinator._pending_predictor_paths
+    assert third_id in sam_manager.requested
+    assert third_id in harness.coordinator._pending_predictor_ids
     extra_mask_id = uuid.uuid4()
-    extra_path = Path("extra.png")
+    extra_id = uuid.uuid4()
     harness.coordinator._pending_mask_prefetch_ids.add(extra_mask_id)
-    harness.coordinator._pending_predictor_paths.add(extra_path)
+    harness.coordinator._pending_predictor_ids.add(extra_id)
     harness.set_current_image(first_id)
     assert extra_mask_id in mask_service.cancel_calls
     assert third_id not in mask_service.cancel_calls
-    assert extra_path in sam_manager.cancelled
-    assert path3 in sam_manager.cancelled
-    assert path3 in harness.coordinator._pending_predictor_paths
+    assert extra_id in sam_manager.cancelled
+    assert third_id in sam_manager.cancelled
+    assert third_id in harness.coordinator._pending_predictor_ids
     harness.set_current_image(third_id)
-    assert path3 in sam_manager.requested
-    assert sam_manager.requested.count(path3) >= 2
+    assert third_id in sam_manager.requested
+    assert sam_manager.requested.count(third_id) >= 2
 
 
 def test_set_current_image_reports_pending_activation(harness):
@@ -525,9 +534,12 @@ def test_set_current_image_reports_pending_activation(harness):
 def test_apply_image_emits_loaded_and_fits_view(harness):
     image = _solid_image(Qt.green)
     source_path = Path("applied.png")
+    image_id = uuid.uuid4()
     emissions: list[Path] = []
     harness.qpane.imageLoaded.connect(emissions.append)
-    harness.coordinator.apply_image(image, source_path, fit_view=True)
+    harness.coordinator.apply_image(
+        image, source_path, image_id=image_id, fit_view=True
+    )
     assert emissions == [source_path]
     assert harness.viewport.get_zoom_mode() == ViewportZoomMode.FIT
     assert harness.qpane.original_image is image
@@ -539,11 +551,11 @@ def test_prefetch_neighbors_tracks_tiles_and_pyramids(harness):
     harness.add_image(color=Qt.green, path=Path("third.png"))
     harness.set_current_image(first_id)
     coordinator = harness.coordinator
-    scheduled_pyramids: list[Path] = []
+    scheduled_pyramids: list[uuid.UUID] = []
     scheduled_tiles: list[list[TileIdentifier]] = []
 
-    def fake_prefetch_pyramid(image, path, reason="prefetch"):
-        scheduled_pyramids.append(path)
+    def fake_prefetch_pyramid(image_id, image, source_path, reason="prefetch"):
+        scheduled_pyramids.append(image_id)
         return True
 
     def fake_prefetch_tiles(identifiers, source_image, *, reason="prefetch"):
@@ -553,7 +565,7 @@ def test_prefetch_neighbors_tracks_tiles_and_pyramids(harness):
 
     harness.catalog.pyramid_manager.prefetch_pyramid = fake_prefetch_pyramid
     harness.tile_manager.prefetch_tiles = fake_prefetch_tiles
-    coordinator._pending_pyramid_paths.clear()
+    coordinator._pending_pyramid_ids.clear()
     coordinator._pyramid_prefetch_recent.clear()
     coordinator._pending_tile_prefetch_ids.clear()
     coordinator.prefetch_neighbors(first_id)
@@ -622,10 +634,10 @@ def test_prefetch_pyramids_skips_recent_duplicates(harness, monkeypatch):
     first_id = harness.add_image(color=Qt.red, path=Path("first.png"))
     harness.add_image(color=Qt.blue, path=Path("second.png"))
     manager = harness.catalog.pyramid_manager
-    calls: list[Path] = []
+    calls: list[uuid.UUID] = []
 
-    def fake_prefetch(image, path, reason="prefetch"):
-        calls.append(path)
+    def fake_prefetch(image_id, image, source_path, reason="prefetch"):
+        calls.append(image_id)
         return True
 
     manager.prefetch_pyramid = fake_prefetch
@@ -648,16 +660,16 @@ def test_prefetch_pyramids_skips_recent_duplicates(harness, monkeypatch):
         1.0,
     )
     swap_coordinator = harness.coordinator
-    swap_coordinator._pending_pyramid_paths.clear()
+    swap_coordinator._pending_pyramid_ids.clear()
     swap_coordinator._pyramid_prefetch_recent.clear()
     swap_coordinator.prefetch_neighbors(first_id)
     assert calls
-    swap_coordinator._pending_pyramid_paths.clear()
+    swap_coordinator._pending_pyramid_ids.clear()
     baseline = len(calls)
     clock["value"] += 0.2
     swap_coordinator.prefetch_neighbors(first_id)
     assert len(calls) == baseline
-    swap_coordinator._pending_pyramid_paths.clear()
+    swap_coordinator._pending_pyramid_ids.clear()
     clock["value"] += 2.0
     swap_coordinator.prefetch_neighbors(first_id)
     assert len(calls) > baseline

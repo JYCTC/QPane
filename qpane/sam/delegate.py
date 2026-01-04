@@ -20,8 +20,7 @@ from __future__ import annotations
 
 
 import logging
-
-from pathlib import Path
+import uuid
 
 from typing import TYPE_CHECKING
 
@@ -130,10 +129,10 @@ class SamDelegate:
         """Drop any predictor cached for the current image."""
         self._active_predictor = None
 
-    def _on_predictor_ready(self, predictor, path: Path) -> None:
+    def _on_predictor_ready(self, predictor, image_id: uuid.UUID) -> None:
         """Activate the predictor when it aligns with the current image and refresh the view."""
         qpane = self._qpane
-        if path == qpane.currentImagePath:
+        if image_id == qpane.currentImageID():
             self._active_predictor = predictor
             qpane.refreshCursor()
             qpane.update()
@@ -151,11 +150,11 @@ class SamDelegate:
             logger.warning("SAM mask dropped because mask service is unavailable")
             self._warned_missing_mask_service = True
 
-    def _on_sam_predictor_failed(self, path: Path, message: str) -> None:
+    def _on_sam_predictor_failed(self, image_id: uuid.UUID, message: str) -> None:
         """Log predictor failures and clear the active predictor for the displayed image."""
         qpane = self._qpane
-        logger.error("SAM predictor failed for %s: %s", path, message)
-        if path == qpane.currentImagePath:
+        logger.error("SAM predictor failed for %s: %s", image_id, message)
+        if image_id == qpane.currentImageID():
             self.resetActivePredictor()
             qpane.refreshCursor()
             qpane.update()

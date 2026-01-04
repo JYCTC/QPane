@@ -86,7 +86,7 @@ class RenderingPresenter:
             return None
         target_width = original_image.width() * self.viewport.zoom
         source_image = self._catalog.getBestFitImage(
-            self._qpane.currentImagePath, target_width
+            self._qpane.currentImageID(), target_width
         )
         if source_image is None or source_image.isNull():
             source_image = original_image
@@ -115,6 +115,7 @@ class RenderingPresenter:
         max_cols = 0
         max_rows = 0
         tiles_to_draw: list[TileRenderData] = []
+        current_id = self._qpane.currentImageID()
         current_path = self._qpane.currentImagePath
         visible_range: tuple[int, int, int, int] | None = None
         if strategy == RenderStrategy.TILE:
@@ -136,7 +137,10 @@ class RenderingPresenter:
             visible_ids: set[TileIdentifier] = set()
             for row in range(start_row, end_row + 1):
                 for col in range(start_col, end_col + 1):
+                    if current_id is None:
+                        continue
                     ident = TileIdentifier(
+                        image_id=current_id,
                         source_path=current_path,
                         pyramid_scale=pyramid_scale,
                         row=row,

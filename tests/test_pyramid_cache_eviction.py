@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from pathlib import Path
+import uuid
 
 import pytest
 from PySide6.QtGui import QImage
@@ -35,7 +35,7 @@ def test_pyramid_allow_cache_insert_guard(caplog):
     manager = PyramidManager(config=Config(), executor=StubExecutor())
     manager.cache_limit_bytes = 100
     manager.set_admission_guard(lambda _size: False)
-    key = Path("a.png")
+    key = uuid.uuid4()
     caplog.set_level("WARNING")
     assert manager._allow_cache_insert(50, key) is False
     assert manager._allow_cache_insert(50, key) is False
@@ -52,16 +52,18 @@ def test_pyramid_eviction_batch_drops_entries():
     """Eviction should remove cached pyramids and update byte counts."""
     manager = PyramidManager(config=Config(), executor=StubExecutor())
     manager.cache_limit_bytes = 0
-    path = Path("a.png")
+    image_id = uuid.uuid4()
     pyramid = ImagePyramid(
-        source_path=path, full_resolution_image=QImage(4, 4, QImage.Format_ARGB32)
+        image_id=image_id,
+        source_path=None,
+        full_resolution_image=QImage(4, 4, QImage.Format_ARGB32),
     )
     pyramid.size_bytes = 8
-    manager._cache = OrderedDict({path: pyramid})
-    manager._pyramids[path] = pyramid
+    manager._cache = OrderedDict({image_id: pyramid})
+    manager._pyramids[image_id] = pyramid
     manager._cache_size_bytes = pyramid.size_bytes
     manager._run_eviction_batch()
     assert manager._cache_size_bytes == 0
-    assert path not in manager._cache
-    assert path not in manager._pyramids
+    assert image_id not in manager._cache
+    assert image_id not in manager._pyramids
     assert manager._evictions_total == 1

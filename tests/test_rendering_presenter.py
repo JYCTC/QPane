@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+import uuid
 
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QImage, Qt
@@ -89,6 +90,7 @@ class StubQPane(QWidget):
         self._view = StubView()
         self.original_image = QImage()
         self.currentImagePath: Path | None = None
+        self._current_image_id = uuid.uuid4()
         self._is_blank = True
         self.resize(*size)
 
@@ -114,6 +116,9 @@ class StubQPane(QWidget):
         rect.setHeight(rect.height() * self._dpr)
         return rect
 
+    def currentImageID(self):  # pragma: no cover - stub for presenter lookup
+        return self._current_image_id
+
 
 class StubCatalog:
     """Simplified catalog returning a preloaded QImage."""
@@ -135,9 +140,9 @@ class StubCatalog:
         """Inject a callable that mirrors ImageCatalog.getBestFitImage."""
         self._resolver = resolver
 
-    def getBestFitImage(self, path, width):  # pragma: no cover - simple passthrough
+    def getBestFitImage(self, image_id, width):  # pragma: no cover - simple passthrough
         if self._resolver is not None:
-            return self._resolver(path, width)
+            return self._resolver(image_id, width)
         return self._base_image
 
 
@@ -188,12 +193,15 @@ class PresenterHarness:
         image: QImage,
         *,
         path: Path | None = None,
+        image_id: uuid.UUID | None = None,
     ) -> None:
         """Update the original image and catalog backing data."""
         self.catalog.set_base_image(image)
         self.qpane.original_image = image
         if path is not None:
             self.qpane.currentImagePath = path
+        if image_id is not None:
+            self.qpane._current_image_id = image_id
         self.viewport.setContentSize(image.size())
 
     def set_catalog_resolver(self, resolver) -> None:

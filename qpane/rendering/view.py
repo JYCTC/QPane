@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 
-from pathlib import Path
+import uuid
 
 from typing import TYPE_CHECKING
 
@@ -164,9 +164,9 @@ class View:
         """Forward tile-ready signals to the swap delegate."""
         self.swap_delegate.handle_tile_ready(identifier)
 
-    def handle_pyramid_ready(self, source_path: Path | None) -> None:
+    def handle_pyramid_ready(self, image_id: uuid.UUID | None) -> None:
         """Bridge pyramid-ready notifications from the catalog to swap plumbing."""
-        self.swap_delegate.handle_pyramid_ready(source_path)
+        self.swap_delegate.handle_pyramid_ready(image_id)
 
     def _attach_pyramid_manager(self) -> None:
         """Wire the catalog's pyramid manager into the shared cache registry."""

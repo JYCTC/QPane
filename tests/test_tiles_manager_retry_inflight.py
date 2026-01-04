@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 from pathlib import Path
+import uuid
 import pytest
 from PySide6.QtGui import QImage
 from qpane import Config
@@ -34,7 +35,8 @@ def test_tiles_inflight_tracked_via_retry_controller(qapp) -> None:
     manager = TileManager(config=config, executor=executor)
     image = QImage(128, 128, QImage.Format_ARGB32)
     image.fill(0)
-    ident = TileIdentifier(Path("rt.png"), 1.0, 0, 0)
+    image_id = uuid.uuid4()
+    ident = TileIdentifier(image_id, Path("rt.png"), 1.0, 0, 0)
     # First request should submit exactly one task and record inflight
     assert manager.get_tile(ident, image) is None
     pending = list(executor.pending_tasks())

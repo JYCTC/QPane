@@ -17,6 +17,7 @@
 """Tests for SAM feature installation and interactions."""
 
 import types
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -120,9 +121,11 @@ def qpane_with_sam(monkeypatch, qapp):
 def test_sam_feature_ignores_empty_bbox(monkeypatch, qpane_with_sam, caplog):
     qpane = qpane_with_sam
     calls = []
+    image_id = uuid.uuid4()
+    monkeypatch.setattr(qpane, "currentImageID", lambda: image_id)
 
-    def record_mask(path, bbox, erase_mode=False):
-        calls.append((path, bbox, erase_mode))
+    def record_mask(captured_id, bbox, erase_mode=False):
+        calls.append((captured_id, bbox, erase_mode))
 
     manager = qpane.samManager()
     monkeypatch.setattr(manager, "generateMaskFromBox", record_mask)
@@ -138,7 +141,7 @@ def test_sam_feature_ignores_empty_bbox(monkeypatch, qpane_with_sam, caplog):
         valid_bbox,
         True,
     )
-    assert calls[-1] == (qpane.currentImagePath, valid_bbox, True)
+    assert calls[-1] == (image_id, valid_bbox, True)
 
 
 def test_sam_feature_component_adjusts_mask(qpane_with_sam):

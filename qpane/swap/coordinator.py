@@ -108,9 +108,9 @@ class SwapCoordinator:
         self._sam_manager = sam_manager
         self._navigation_history: deque[uuid.UUID] = deque(maxlen=16)
         self._pending_mask_prefetch_ids: set[uuid.UUID] = set()
-        self._pending_predictor_paths: set[Path] = set()
-        self._pending_pyramid_paths: set[Path] = set()
-        self._pyramid_prefetch_recent: dict[Path, float] = {}
+        self._pending_predictor_ids: set[uuid.UUID] = set()
+        self._pending_pyramid_ids: set[uuid.UUID] = set()
+        self._pyramid_prefetch_recent: dict[uuid.UUID, float] = {}
         self._pending_tile_prefetch_ids: set[TileIdentifier] = set()
         self._navigation_inflight_start_ns: int | None = None
         self._last_navigation_duration_ms: float | None = None
@@ -171,10 +171,7 @@ class SwapCoordinator:
         qpane.currentImageChanged.emit(image_id)
         neighbor_ids = self._candidate_prefetch_ids(image_id)
         skip_ids = set(neighbor_ids) | {image_id}
-        target_path = self._catalog.getPath(image_id)
-        skip_paths: set[Path] = set()
-        if target_path is not None:
-            skip_paths.add(target_path)
+        skip_predictor_ids: set[uuid.UUID] = {image_id}
         service = self._mask_service
         mask_manager = service.manager if service is not None else None
         if mask_manager is not None:
@@ -184,13 +181,17 @@ class SwapCoordinator:
                 )  # type: ignore[attr-defined]
                 if not mask_ids:
                     continue
-                candidate_path = self._catalog.getPath(candidate_id)
-                if candidate_path is not None:
-                    skip_paths.add(candidate_path)
+                skip_predictor_ids.add(candidate_id)
         self._cancel_mask_prefetches(reason="navigation", skip=skip_ids)
-        self._cancel_pending_predictors(reason="navigation", skip=skip_paths or None)
-        self._cancel_pyramid_prefetches(reason="navigation", skip=skip_paths)
-        self._cancel_tile_prefetches(reason="navigation", skip=skip_paths)
+        self._cancel_pending_predictors(
+            reason="navigation",
+            skip=skip_predictor_ids or None,
+        )
+        self._cancel_pyramid_prefetches(
+            reason="navigation",
+            skip=skip_predictor_ids,
+        )
+        self._cancel_tile_prefetches(reason="navigation", skip=skip_predictor_ids)
         fit_view = False if fit_view is None else bool(fit_view)
         self.display_current_image(fit_view=fit_view)
         self.prefetch_neighbors(image_id, candidates=neighbor_ids)
@@ -226,13 +227,19 @@ class SwapCoordinator:
             self._qpane.blank()
             return
         current_path = self._catalog.getCurrentPath()
-        self.apply_image(image, current_path, fit_view=fit_view)
+        self.apply_image(
+            image,
+            current_path,
+            image_id=self._catalog.getCurrentId(),
+            fit_view=fit_view,
+        )
 
     def apply_image(
         self,
         image: QImage,
         source_path: Path | None,
         *,
+        image_id: uuid.UUID | None,
         fit_view: bool,
     ) -> None:
         """Display ``image`` from ``source_path`` and refresh view state.
@@ -240,6 +247,7 @@ class SwapCoordinator:
         Args:
             image: Image to render in the qpane.
             source_path: Filesystem path associated with ``image``, when known.
+            image_id: Catalog identifier associated with ``image`` when available.
             fit_view: Fit the viewport to the image when True.
 
         Side effects:
@@ -254,16 +262,20 @@ class SwapCoordinator:
         qpane.setUpdatesEnabled(False)
         try:
             qpane.resetActiveSamPredictor()
-            if source_path is not None and self._sam_manager is not None:
+            if image_id is not None and self._sam_manager is not None:
                 try:
-                    self._sam_manager.requestPredictor(image, source_path)
+                    self._sam_manager.requestPredictor(
+                        image,
+                        image_id,
+                        source_path=source_path,
+                    )
                 except Exception:
                     logger.exception(
-                        "SAM predictor request failed (path=%s)",
-                        source_path,
+                        "SAM predictor request failed (image_id=%s)",
+                        image_id,
                     )
                 else:
-                    self._pending_predictor_paths.add(source_path)
+                    self._pending_predictor_ids.add(image_id)
             qpane.original_image = image
             self._viewport.setContentSize(qpane.original_image.size())
             if fit_view:
@@ -271,12 +283,12 @@ class SwapCoordinator:
             content_changed = self._catalog.updateCurrentEntry(
                 image=image, path=source_path
             )
-            if content_changed and source_path is not None:
-                self._tile_manager.remove_tiles_for_path(source_path)
+            if content_changed and image_id is not None:
+                self._tile_manager.remove_tiles_for_image_id(image_id)
                 if self._sam_manager is not None:
                     remove_cache = getattr(self._sam_manager, "removeFromCache", None)
                     if callable(remove_cache):
-                        remove_cache(source_path)
+                        remove_cache(image_id)
             qpane.setMinimumSize(qpane.minimumSizeHint())
             qpane.view().allocate_buffers()
             qpane.imageLoaded.emit(source_path or Path())
@@ -320,14 +332,14 @@ class SwapCoordinator:
         """Cancel outstanding predictor warm-ups and drop the SAM manager."""
         self._cancel_pending_predictors(reason="sam-detached")
         self._sam_manager = None
-        self._pending_predictor_paths.clear()
+        self._pending_predictor_ids.clear()
 
     def snapshot_metrics(self) -> SwapCoordinatorMetrics:
         """Return counters describing outstanding swap and prefetch work."""
         return SwapCoordinatorMetrics(
             pending_mask_prefetch=len(self._pending_mask_prefetch_ids),
-            pending_predictors=len(self._pending_predictor_paths),
-            pending_pyramid_prefetch=len(self._pending_pyramid_paths),
+            pending_predictors=len(self._pending_predictor_ids),
+            pending_pyramid_prefetch=len(self._pending_pyramid_ids),
             pending_tile_prefetch=len(self._pending_tile_prefetch_ids),
             last_navigation_ms=self._last_navigation_duration_ms,
         )
@@ -424,9 +436,9 @@ class SwapCoordinator:
         self._pending_tile_prefetch_ids.discard(identifier)
         self._mark_diagnostics_dirty()
 
-    def _on_pyramid_ready(self, path: Path) -> None:
+    def _on_pyramid_ready(self, image_id: uuid.UUID) -> None:
         """Stop tracking pyramid prefetches once they are ready."""
-        self._pending_pyramid_paths.discard(path)
+        self._pending_pyramid_ids.discard(image_id)
         self._mark_diagnostics_dirty()
 
     def _cancel_pending_items(
@@ -508,29 +520,29 @@ class SwapCoordinator:
         self._mark_diagnostics_dirty()
 
     def _cancel_pending_predictors(
-        self, *, reason: str, skip: Collection[Path] | None = None
+        self, *, reason: str, skip: Collection[uuid.UUID] | None = None
     ) -> None:
-        """Cancel scheduled SAM predictor warm-ups except for paths listed in ``skip``."""
+        """Cancel scheduled SAM predictor warm-ups except for IDs listed in ``skip``."""
         manager = self._sam_manager
-        skip_paths = set(skip or ())
+        skip_ids = set(skip or ())
         if manager is None:
-            self._pending_predictor_paths = skip_paths
+            self._pending_predictor_ids = skip_ids
             return
         if not hasattr(manager, "cancelPendingPredictor"):
             raise AttributeError("SAM manager must expose cancelPendingPredictor")
-        self._pending_predictor_paths = self._cancel_pending_items(
-            pending=self._pending_predictor_paths,
-            skip=skip_paths,
+        self._pending_predictor_ids = self._cancel_pending_items(
+            pending=self._pending_predictor_ids,
+            skip=skip_ids,
             cancel_fn=manager.cancelPendingPredictor,
             reason=reason,
             log_name="SAM predictor",
-            item_label="path",
+            item_label="image_id",
             missing_hint="SAM manager missing cancelPendingPredictor",
         )
         self._mark_diagnostics_dirty()
 
     def _cancel_pyramid_prefetches(
-        self, *, reason: str, skip: Collection[Path] | None = None
+        self, *, reason: str, skip: Collection[uuid.UUID] | None = None
     ) -> None:
         """Cancel tracked pyramid prefetches except those in ``skip``."""
         manager = getattr(self._catalog, "pyramid_manager", None)
@@ -538,37 +550,39 @@ class SwapCoordinator:
             raise AttributeError("Catalog must expose pyramid_manager")
         if not hasattr(manager, "cancel_prefetch"):
             raise AttributeError("Pyramid manager must expose cancel_prefetch")
-        skip_paths = set(skip or ())
-        if not self._pending_pyramid_paths:
+        skip_ids = set(skip or ())
+        if not self._pending_pyramid_ids:
             return
-        pending = set(self._pending_pyramid_paths)
-        cancel_paths = [path for path in pending if path not in skip_paths]
-        if cancel_paths:
+        pending = set(self._pending_pyramid_ids)
+        cancel_ids = [image_id for image_id in pending if image_id not in skip_ids]
+        if cancel_ids:
             try:
-                manager.cancel_prefetch(cancel_paths, reason=reason)
+                manager.cancel_prefetch(cancel_ids, reason=reason)
             except Exception:
                 logger.exception(
                     "Pyramid prefetch cancellation failed (count=%s, reason=%s)",
-                    len(cancel_paths),
+                    len(cancel_ids),
                     reason,
                 )
-        self._pending_pyramid_paths = {path for path in pending if path in skip_paths}
+        self._pending_pyramid_ids = {
+            image_id for image_id in pending if image_id in skip_ids
+        }
         self._mark_diagnostics_dirty()
 
     def _cancel_tile_prefetches(
-        self, *, reason: str, skip: Collection[Path] | None = None
+        self, *, reason: str, skip: Collection[uuid.UUID] | None = None
     ) -> None:
-        """Cancel tile prefetch jobs whose source paths are not in ``skip``."""
+        """Cancel tile prefetch jobs whose image IDs are not in ``skip``."""
         manager = self._tile_manager
         if not hasattr(manager, "cancel_prefetch"):
             raise AttributeError("Tile manager must expose cancel_prefetch")
-        skip_paths = set(skip or ())
+        skip_ids = set(skip or ())
         if not self._pending_tile_prefetch_ids:
             return
         cancel_idents = [
             ident
             for ident in self._pending_tile_prefetch_ids
-            if ident.source_path not in skip_paths
+            if ident.image_id not in skip_ids
         ]
         if cancel_idents:
             try:
@@ -584,7 +598,7 @@ class SwapCoordinator:
         self._pending_tile_prefetch_ids = {
             ident
             for ident in self._pending_tile_prefetch_ids
-            if ident.source_path in skip_paths
+            if ident.image_id in skip_ids
         }
         self._mark_diagnostics_dirty()
 
@@ -680,21 +694,25 @@ class SwapCoordinator:
         for neighbor_id in neighbor_list:
             if neighbor_id == current_id:
                 continue
-            path = self._catalog.getPath(neighbor_id)
-            if path is None or path in self._pending_predictor_paths:
+            if neighbor_id in self._pending_predictor_ids:
                 continue
             image = self._catalog.getImage(neighbor_id)
             if image is None or image.isNull():
                 continue
+            path = self._catalog.getPath(neighbor_id)
             try:
-                manager.requestPredictor(image, path)
+                manager.requestPredictor(
+                    image,
+                    neighbor_id,
+                    source_path=path,
+                )
             except Exception:
                 logger.exception(
-                    "SAM predictor prefetch failed (path=%s)",
-                    path,
+                    "SAM predictor prefetch failed (image_id=%s)",
+                    neighbor_id,
                 )
                 continue
-            self._pending_predictor_paths.add(path)
+            self._pending_predictor_ids.add(neighbor_id)
 
     def _maybe_prefetch_pyramids(
         self, current_id: uuid.UUID, candidates: Sequence[uuid.UUID]
@@ -713,14 +731,10 @@ class SwapCoordinator:
         neighbor_ids = list(candidates)
         if depth > 0:
             neighbor_ids = neighbor_ids[:depth]
-        current_path = self._catalog.getPath(current_id)
         for neighbor_id in neighbor_ids:
             if neighbor_id == current_id:
                 continue
-            path = self._catalog.getPath(neighbor_id)
-            if path is None:
-                continue
-            recent_ns = self._pyramid_prefetch_recent.get(path)
+            recent_ns = self._pyramid_prefetch_recent.get(neighbor_id)
             now_sec = time.monotonic()
             if (
                 recent_ns is not None
@@ -728,27 +742,33 @@ class SwapCoordinator:
             ):
                 logger.debug(
                     "Skipping pyramid prefetch for %s; scheduled %.2fs ago",
-                    path,
+                    neighbor_id,
                     now_sec - recent_ns,
                 )
                 continue
-            if path in self._pending_pyramid_paths:
-                continue
-            if current_path is not None and path == current_path:
+            if neighbor_id in self._pending_pyramid_ids:
                 continue
             image = self._catalog.getImage(neighbor_id)
             if image is None or image.isNull():
                 continue
             try:
                 scheduled = bool(
-                    manager.prefetch_pyramid(image, path, reason="neighbor")
+                    manager.prefetch_pyramid(
+                        neighbor_id,
+                        image,
+                        self._catalog.getPath(neighbor_id),
+                        reason="neighbor",
+                    )
                 )
             except Exception:
-                logger.exception("Pyramid prefetch submission failed (path=%s)", path)
+                logger.exception(
+                    "Pyramid prefetch submission failed (image_id=%s)",
+                    neighbor_id,
+                )
                 continue
             if scheduled:
-                self._pending_pyramid_paths.add(path)
-                self._pyramid_prefetch_recent[path] = now_sec
+                self._pending_pyramid_ids.add(neighbor_id)
+                self._pyramid_prefetch_recent[neighbor_id] = now_sec
                 # prune stale entries
                 stale_cutoff = now_sec - (PYRAMID_RESUBMIT_COOLDOWN_SEC * 4)
                 self._pyramid_prefetch_recent = {
@@ -756,7 +776,7 @@ class SwapCoordinator:
                     for k, v in self._pyramid_prefetch_recent.items()
                     if v >= stale_cutoff
                 }
-                logger.info("Pyramid prefetch scheduled for %s", path)
+                logger.info("Pyramid prefetch scheduled for %s", neighbor_id)
 
     def _maybe_prefetch_tiles(
         self, current_id: uuid.UUID, candidates: Sequence[uuid.UUID]
@@ -770,7 +790,6 @@ class SwapCoordinator:
         depth = self._tile_prefetch_depth
         if depth == 0:
             return
-        current_path = self._catalog.getPath(current_id)
         cache_limit = getattr(manager, "cache_limit_bytes", 0)
         cache_usage = getattr(manager, "cache_usage_bytes", 0)
         neighbor_ids = list(candidates)
@@ -779,18 +798,19 @@ class SwapCoordinator:
         for neighbor_id in neighbor_ids:
             if neighbor_id == current_id:
                 continue
-            path = self._catalog.getPath(neighbor_id)
-            if path is None:
-                continue
-            if current_path is not None and path == current_path:
-                continue
             if cache_limit and cache_usage >= cache_limit:
-                logger.debug("Skipping tile prefetch (cache full) for %s", path)
+                logger.debug(
+                    "Skipping tile prefetch (cache full) for %s",
+                    neighbor_id,
+                )
                 break
             image = self._catalog.getImage(neighbor_id)
             if image is None or image.isNull():
                 continue
-            prepared = self._prepare_tile_prefetch(path=path, image=image)
+            prepared = self._prepare_tile_prefetch(
+                image_id=neighbor_id,
+                image=image,
+            )
             if prepared is None:
                 continue
             source_image, identifiers = prepared
@@ -803,7 +823,10 @@ class SwapCoordinator:
                     pending, source_image, reason="neighbor"
                 )
             except Exception:
-                logger.exception("Tile prefetch submission failed (path=%s)", path)
+                logger.exception(
+                    "Tile prefetch submission failed (image_id=%s)",
+                    neighbor_id,
+                )
                 continue
             scheduled_list = list(scheduled)
             if not scheduled_list:
@@ -812,11 +835,13 @@ class SwapCoordinator:
                 self._pending_tile_prefetch_ids.add(ident)
             cache_usage = getattr(manager, "cache_usage_bytes", cache_usage)
             logger.info(
-                "Tile prefetch scheduled for %s (%s tiles)", path, len(scheduled_list)
+                "Tile prefetch scheduled for %s (%s tiles)",
+                neighbor_id,
+                len(scheduled_list),
             )
 
     def _prepare_tile_prefetch(
-        self, *, path: Path, image: QImage
+        self, *, image_id: uuid.UUID, image: QImage
     ) -> tuple[QImage, list[TileIdentifier]] | None:
         """Return a source image and centered tile identifiers for neighbor prefetching."""
         manager = self._tile_manager
@@ -829,7 +854,7 @@ class SwapCoordinator:
             return None
         zoom = self._viewport.zoom if self._viewport.zoom > 0 else 1.0
         target_width = width * zoom
-        source_image = self._catalog.getBestFitImage(path, target_width)
+        source_image = self._catalog.getBestFitImage(image_id, target_width)
         if source_image is None or source_image.isNull():
             source_image = image
         if source_image.isNull():
@@ -861,11 +886,23 @@ class SwapCoordinator:
             col = center_col + dc
             if row < 0 or row >= rows or col < 0 or col >= cols:
                 continue
-            ident = TileIdentifier(path, pyramid_scale, row, col)
+            ident = TileIdentifier(
+                image_id=image_id,
+                source_path=self._catalog.getPath(image_id),
+                pyramid_scale=pyramid_scale,
+                row=row,
+                col=col,
+            )
             if ident not in identifiers:
                 identifiers.append(ident)
         if not identifiers:
             identifiers.append(
-                TileIdentifier(path, pyramid_scale, center_row, center_col)
+                TileIdentifier(
+                    image_id=image_id,
+                    source_path=self._catalog.getPath(image_id),
+                    pyramid_scale=pyramid_scale,
+                    row=center_row,
+                    col=center_col,
+                )
             )
         return source_image, identifiers

@@ -267,7 +267,7 @@ def install_sam_feature(qpane: "QPane", device: str | None = None) -> None:
         manager = qpane.samManager()
         if manager is None:
             return
-        if qpane.currentImagePath is None:
+        if qpane.currentImageID() is None:
             logger.warning("Ignoring smart-select request: no image is active")
             return
         if bbox is None:
@@ -281,7 +281,7 @@ def install_sam_feature(qpane: "QPane", device: str | None = None) -> None:
             )
             return
         manager.generateMaskFromBox(
-            qpane.currentImagePath, bbox_array, erase_mode=is_erase
+            qpane.currentImageID(), bbox_array, erase_mode=is_erase
         )
 
     def _handle_component_adjustment(image_point: QPoint, grow: bool):

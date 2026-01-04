@@ -18,6 +18,7 @@
 
 import logging
 import random
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Iterable
@@ -54,7 +55,8 @@ class _PredictorRetryEntry:
     attempts: int
     timer: QTimer
     image: QImage
-    path: Path
+    image_id: uuid.UUID
+    source_path: Path | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,8 +74,8 @@ class SamPredictorMetrics:
 class SamWorkerSignals(QObject):
     """Signals emitted by SamWorker for completion and failures."""
 
-    finished = Signal(object, Path)
-    error = Signal(Path, str)
+    finished = Signal(object, uuid.UUID)
+    error = Signal(uuid.UUID, str)
 
 
 class SamWorker(QRunnable, BaseWorker):
@@ -82,7 +84,8 @@ class SamWorker(QRunnable, BaseWorker):
     def __init__(
         self,
         image: QImage,
-        path: Path,
+        image_id: uuid.UUID,
+        path: Path | None,
         checkpoint_path: Path,
         device: str = "cpu",
     ):
@@ -90,6 +93,7 @@ class SamWorker(QRunnable, BaseWorker):
         super().__init__()
         BaseWorker.__init__(self)
         self.image = image
+        self.image_id = image_id
         self.path = path
         self._device = device
         self._checkpoint_path = checkpoint_path
@@ -116,16 +120,18 @@ class SamWorker(QRunnable, BaseWorker):
             if self.is_cancelled:
                 self._handle_cancelled()
                 return
-            self.emit_finished(True, payload=(predictor, self.path))
+            self.emit_finished(True, payload=(predictor, self.image_id))
         except service.SamDependencyError as exc:
-            self.emit_finished(False, payload=(self.path, str(exc)), error=exc)
+            self.emit_finished(False, payload=(self.image_id, str(exc)), error=exc)
         except Exception as exc:  # pragma: no cover - defensive guard
-            self.emit_finished(False, payload=(self.path, str(exc)), error=exc)
+            self.emit_finished(False, payload=(self.image_id, str(exc)), error=exc)
 
     def _handle_cancelled(self) -> None:
         """Emit a cancellation result when work stops early."""
-        self.logger.info("Cancelled SAM predictor load for %s", self.path)
-        self.emit_finished(False, payload=(self.path, "cancelled"))
+        self.logger.info(
+            "Cancelled SAM predictor load for %s", self.path or self.image_id
+        )
+        self.emit_finished(False, payload=(self.image_id, "cancelled"))
 
     @staticmethod
     def _prepare_image_rgb(image: QImage) -> np.ndarray:
@@ -148,15 +154,15 @@ class SamWorker(QRunnable, BaseWorker):
 class SamManager(QObject):
     """Manage SAM predictor caching, retries, and mask generation for a device.
 
-    Caches predictors per image path, schedules background preparation, and
+    Caches predictors per image ID, schedules background preparation, and
     emits signals when predictors are ready, throttled, trimmed, or fail to load.
     """
 
-    predictorReady = Signal(object, Path)
-    predictorLoadFailed = Signal(Path, str)
-    predictorThrottled = Signal(Path, int)
+    predictorReady = Signal(object, uuid.UUID)
+    predictorLoadFailed = Signal(uuid.UUID, str)
+    predictorThrottled = Signal(uuid.UUID, int)
     predictorCacheCleared = Signal()
-    predictorRemoved = Signal(Path)
+    predictorRemoved = Signal(uuid.UUID)
     maskReady = Signal(object, np.ndarray, bool)
 
     def __init__(
@@ -180,13 +186,16 @@ class SamManager(QObject):
         self._device = device
         self._checkpoint_path = checkpoint_path
         self._executor: TaskExecutorProtocol | None = executor
-        self._sam_predictors: dict[Path, "SamPredictor"] = {}
+        self._sam_predictors: dict[uuid.UUID, "SamPredictor"] = {}
         self._cache_hits: int = 0
         self._cache_misses: int = 0
-        self._predictor_sizes: Dict[Path, int] = {}
-        self._pending_estimates: Dict[Path, int] = {}
-        self._inflight: dict[Path, tuple[SamWorker, TaskHandle]] = {}
-        self._predictor_retry_entries: dict[tuple[Path, str], _PredictorRetryEntry] = {}
+        self._predictor_sizes: Dict[uuid.UUID, int] = {}
+        self._predictor_paths: Dict[uuid.UUID, Path | None] = {}
+        self._pending_estimates: Dict[uuid.UUID, int] = {}
+        self._inflight: dict[uuid.UUID, tuple[SamWorker, TaskHandle]] = {}
+        self._predictor_retry_entries: dict[
+            tuple[uuid.UUID, str], _PredictorRetryEntry
+        ] = {}
         self._retry_controller = RetryEntriesView(
             "sam", lambda: self._predictor_retry_entries
         )
@@ -227,7 +236,7 @@ class SamManager(QObject):
         """Return how many predictors are cached for reuse."""
         return len(self._sam_predictors)
 
-    def predictorPaths(self) -> list[Path]:
+    def predictorImageIds(self) -> list[uuid.UUID]:
         """Return the cached predictor keys for eviction and diagnostics."""
         return list(self._sam_predictors.keys())
 
@@ -263,22 +272,28 @@ class SamManager(QObject):
         except Exception:  # pragma: no cover - defensive fallback
             return len(self._inflight)
 
-    def getPredictor(self, path: Path) -> "SamPredictor | None":
-        """Return the cached predictor for path and record the cache hit when present."""
-        predictor = self._sam_predictors.get(path)
+    def getPredictor(self, image_id: uuid.UUID) -> "SamPredictor | None":
+        """Return the cached predictor for image_id and record the cache hit when present."""
+        predictor = self._sam_predictors.get(image_id)
         if predictor is not None:
             self._cache_hits += 1
         return predictor
 
-    def requestPredictor(self, image: QImage, path: Path):
-        """Request a predictor for path, emitting predictorReady on cache hit or queueing background work.
+    def requestPredictor(
+        self,
+        image: QImage,
+        image_id: uuid.UUID,
+        *,
+        source_path: Path | None = None,
+    ):
+        """Request a predictor for image_id, emitting predictorReady on cache hit or queueing background work.
 
         Side effects:
             Increments cache metrics, coalesces duplicate requests, and emits predictorThrottled when executor capacity is exceeded.
         """
-        predictor = self.getPredictor(path)
+        predictor = self.getPredictor(image_id)
         if predictor is not None:
-            self.predictorReady.emit(predictor, path)
+            self.predictorReady.emit(predictor, image_id)
             return
         if not self.checkpointReady():
             logger.warning(
@@ -286,108 +301,114 @@ class SamManager(QObject):
                 self._checkpoint_path,
             )
             return
-        if path in self._inflight:
-            logger.debug("Predictor request already queued for %s", path)
+        if image_id in self._inflight:
+            logger.debug("Predictor request already queued for %s", image_id)
             return
         self._cache_misses += 1
-        self._pending_estimates[path] = self._estimate_predictor_bytes(image)
+        self._pending_estimates[image_id] = self._estimate_predictor_bytes(image)
+        self._predictor_paths[image_id] = source_path
 
         def _submit(img: QImage, attempt: int):
             """Submit predictor construction to the executor with retry metadata."""
             return self._submit_predictor_job(
-                img, path, attempt=attempt, trap_rejection=False
+                img,
+                image_id,
+                source_path,
+                attempt=attempt,
+                trap_rejection=False,
             )
 
-        def _throttle(key: tuple[Path, str], next_attempt: int, rej: TaskRejected):
+        def _throttle(key: tuple[uuid.UUID, str], next_attempt: int, rej: TaskRejected):
             """Log and surface throttling while keeping retry sequencing."""
-            path_obj, _device = key
+            image_key, _device = key
             logger.warning(
                 "SAM predictor load for %s throttled: pending %s limit=%s "
                 "(total=%s, category=%s)",
-                path_obj,
+                image_key,
                 rej.limit_type,
                 rej.limit_value,
                 rej.pending_total,
                 rej.pending_category,
             )
-            self.predictorThrottled.emit(path_obj, next_attempt)
+            self.predictorThrottled.emit(image_key, next_attempt)
 
         self._retry.queueOrCoalesce(
-            self._retry_key(path), image, submit=_submit, throttle=_throttle
+            self._retry_key(image_id), image, submit=_submit, throttle=_throttle
         )
 
-    def cancelPendingPredictor(self, path: Path) -> bool:
-        """Cancel any in-flight predictor load for path.
+    def cancelPendingPredictor(self, image_id: uuid.UUID) -> bool:
+        """Cancel any in-flight predictor load for image_id.
 
         Returns:
             True when the executor cancelled the task, False when nothing was pending or cancellation fell back to worker signalling.
         """
-        self._retry.cancel(self._retry_key(path))
-        entry = self._inflight.pop(path, None)
+        self._retry.cancel(self._retry_key(image_id))
+        entry = self._inflight.pop(image_id, None)
         if entry is None:
-            self._pending_estimates.pop(path, None)
+            self._pending_estimates.pop(image_id, None)
             return False
         worker, handle = entry
         executor = self._ensure_executor()
         cancelled = executor.cancel(handle)
         if not cancelled:
             worker.cancel()
-        self._pending_estimates.pop(path, None)
+        self._pending_estimates.pop(image_id, None)
         logger.info(
             "Cancelled SAM predictor load for %s (cancelled=%s)",
-            path,
+            image_id,
             cancelled,
         )
         return cancelled
 
     def clearCache(self):
         """Cancel pending loads and retries, drop cached predictors, and emit predictorCacheCleared."""
-        for path in list(self._inflight.keys()):
-            self.cancelPendingPredictor(path)
+        for image_id in list(self._inflight.keys()):
+            self.cancelPendingPredictor(image_id)
         for key in list(self._predictor_retry_entries.keys()):
             self._cancel_predictor_retry(key[0])
         self._sam_predictors.clear()
         self._predictor_sizes.clear()
+        self._predictor_paths.clear()
         self._pending_estimates.clear()
         self.predictorCacheCleared.emit()
 
-    def removeFromCache(self, path: Path):
-        """Remove the cached predictor for path and cancel any queued retry."""
-        self._retry.cancel(self._retry_key(path))
-        self._drop_predictor(path)
+    def removeFromCache(self, image_id: uuid.UUID):
+        """Remove the cached predictor for image_id and cancel any queued retry."""
+        self._retry.cancel(self._retry_key(image_id))
+        self._drop_predictor(image_id)
 
     def shutdown(self) -> None:
         """Cancel pending predictor work and clear retries."""
-        for path in list(self._inflight.keys()):
-            self.cancelPendingPredictor(path)
+        for image_id in list(self._inflight.keys()):
+            self.cancelPendingPredictor(image_id)
         self._retry.cancelAll()
         self._pending_estimates.clear()
 
     def generateMaskFromBox(
-        self, path: Path, bbox: np.ndarray, erase_mode: bool = False
+        self, image_id: uuid.UUID, bbox: np.ndarray, erase_mode: bool = False
     ):
         """Generate a mask from bbox and emit it via maskReady.
 
         Args:
-            path: Image path used to locate the predictor.
+            image_id: Image identifier used to locate the predictor.
             bbox: Bounding box in (x0, y0, x1, y1) order.
             erase_mode: Emit the mask for erasing when True instead of adding.
 
         Side effects:
             Emits maskReady with mask bytes or None and logs warnings for missing predictors or invalid boxes.
         """
-        predictor = self.getPredictor(path)
+        predictor = self.getPredictor(image_id)
         if predictor is None:
             logger.warning(
                 "Mask request skipped because predictor for %s is not ready",
-                path,
+                image_id,
             )
             self.maskReady.emit(None, bbox, erase_mode)
             return
         try:
             mask_array_bool = service.predict_mask_from_box(predictor, bbox)
             if mask_array_bool is None:
-                logger.info("Mask prediction returned no result for %s", path)
+                logger.info("Mask prediction returned no result for %s", image_id)
                 self.maskReady.emit(None, bbox, erase_mode)
                 return
             mask_array_uint8 = mask_array_bool.astype(np.uint8) * 255
@@ -395,14 +416,14 @@ class SamManager(QObject):
         except ValueError as exc:
             logger.warning(
                 "Invalid bounding box for SAM prediction on %s: %s",
-                path,
+                image_id,
                 exc,
             )
             self.maskReady.emit(None, bbox, erase_mode)
         except Exception as exc:  # pragma: no cover - defensive guard
             logger.exception(
                 "Error during mask generation for %s (erase=%s): %s",
-                path,
+                image_id,
                 erase_mode,
                 exc,
             )
@@ -414,37 +435,38 @@ class SamManager(QObject):
             raise RuntimeError("SamManager executor is missing")
         return self._executor
 
-    def _retry_key(self, path: Path) -> tuple[Path, str]:
-        """Return the retry bookkeeping key for path on this device."""
-        return (path, self._device)
+    def _retry_key(self, image_id: uuid.UUID) -> tuple[uuid.UUID, str]:
+        """Return the retry bookkeeping key for image_id on this device."""
+        return (image_id, self._device)
 
-    def _on_worker_finished(self, predictor: "SamPredictor", path: Path):
+    def _on_worker_finished(self, predictor: "SamPredictor", image_id: uuid.UUID):
         """Cache the finished predictor, resolve retries, and emit predictorReady."""
-        self._inflight.pop(path, None)
-        self._retry.onSuccess(self._retry_key(path))
-        self._pending_estimates.pop(path, None)
-        self._sam_predictors[path] = predictor
+        self._inflight.pop(image_id, None)
+        self._retry.onSuccess(self._retry_key(image_id))
+        self._pending_estimates.pop(image_id, None)
+        self._sam_predictors[image_id] = predictor
         measured_bytes = self._measure_predictor_bytes(predictor)
-        self._predictor_sizes[path] = measured_bytes
-        logger.info("SAM predictor ready for %s", path)
-        self.predictorReady.emit(predictor, path)
+        self._predictor_sizes[image_id] = measured_bytes
+        logger.info("SAM predictor ready for %s", image_id)
+        self.predictorReady.emit(predictor, image_id)
         self._enforce_cache_limit()
 
-    def _on_worker_error(self, path: Path, message: str):
+    def _on_worker_error(self, image_id: uuid.UUID, message: str):
         """Remove failed jobs from bookkeeping, update retries, and emit predictorLoadFailed unless cancelled."""
-        self._inflight.pop(path, None)
-        self._retry.onFailure(self._retry_key(path))
-        self._pending_estimates.pop(path, None)
+        self._inflight.pop(image_id, None)
+        self._retry.onFailure(self._retry_key(image_id))
+        self._pending_estimates.pop(image_id, None)
         if message == "cancelled":
-            logger.info("SAM predictor load cancelled for %s", path)
+            logger.info("SAM predictor load cancelled for %s", image_id)
             return
-        logger.error("SAM predictor load failed for %s: %s", path, message)
-        self.predictorLoadFailed.emit(path, message)
+        logger.error("SAM predictor load failed for %s: %s", image_id, message)
+        self.predictorLoadFailed.emit(image_id, message)
 
     def _submit_predictor_job(
         self,
         image: QImage,
-        path: Path,
+        image_id: uuid.UUID,
+        source_path: Path | None,
         *,
         attempt: int,
         trap_rejection: bool,
@@ -453,7 +475,8 @@ class SamManager(QObject):
         executor = self._ensure_executor()
         worker = SamWorker(
             image,
-            path,
+            image_id,
+            source_path,
             self._checkpoint_path,
             device=self._device,
         )
@@ -463,90 +486,121 @@ class SamManager(QObject):
             handle = executor.submit(worker, category="sam", device=self._device)
         except TaskRejected as exc:
             if trap_rejection:
-                self._handle_predictor_rejection(image, path, attempt, exc)
+                self._handle_predictor_rejection(
+                    image, image_id, source_path, attempt, exc
+                )
                 return None
             raise
-        self._inflight[path] = (worker, handle)
+        self._inflight[image_id] = (worker, handle)
         logger.info(
             "Queued SAM predictor load for %s (task=%s)",
-            path,
+            image_id,
             handle.task_id,
         )
         return handle
 
     def _handle_predictor_rejection(
-        self, image: QImage, path: Path, attempt: int, rejection: TaskRejected
+        self,
+        image: QImage,
+        image_id: uuid.UUID,
+        source_path: Path | None,
+        attempt: int,
+        rejection: TaskRejected,
     ) -> None:
         """Log executor throttling and schedule a backoff retry for predictor loads."""
         next_attempt = max(1, attempt + 1)
         logger.warning(
             "SAM predictor load for %s throttled: pending %s limit=%s "
             "(total=%s, category=%s)",
-            path,
+            image_id,
             rejection.limit_type,
             rejection.limit_value,
             rejection.pending_total,
             rejection.pending_category,
         )
-        self.predictorThrottled.emit(path, next_attempt)
-        self._schedule_predictor_retry(image, path, attempts=next_attempt)
+        self.predictorThrottled.emit(image_id, next_attempt)
+        self._schedule_predictor_retry(
+            image, image_id, source_path, attempts=next_attempt
+        )
 
     def _schedule_predictor_retry(
-        self, image: QImage, path: Path, *, attempts: int
+        self,
+        image: QImage,
+        image_id: uuid.UUID,
+        source_path: Path | None,
+        *,
+        attempts: int,
     ) -> None:
         """Schedule a delayed predictor submission retry with exponential backoff."""
         self._run_on_main_thread(
-            lambda: self._schedule_predictor_retry_on_main(image, path, attempts)
+            lambda: self._schedule_predictor_retry_on_main(
+                image, image_id, source_path, attempts
+            )
         )
 
     def _schedule_predictor_retry_on_main(
-        self, image: QImage, path: Path, attempts: int
+        self,
+        image: QImage,
+        image_id: uuid.UUID,
+        source_path: Path | None,
+        attempts: int,
     ) -> None:
         """Main-thread implementation for scheduling predictor retry timers."""
-        key = self._retry_key(path)
+        key = self._retry_key(image_id)
         entry = self._predictor_retry_entries.get(key)
         if entry is None:
             timer = QTimer(self)
             timer.setSingleShot(True)
             timer.timeout.connect(
-                lambda retry_path=path: self._retry_predictor(retry_path)
+                lambda retry_id=image_id: self._retry_predictor(retry_id)
             )
             entry = _PredictorRetryEntry(
-                attempts=attempts, timer=timer, image=image, path=path
+                attempts=attempts,
+                timer=timer,
+                image=image,
+                image_id=image_id,
+                source_path=source_path,
             )
             self._predictor_retry_entries[key] = entry
         else:
             entry.attempts = attempts
             entry.image = image
-            entry.path = path
+            entry.image_id = image_id
+            entry.source_path = source_path
             timer = entry.timer
         delay_ms = self._compute_predictor_retry_delay(attempts)
-        self._pending_estimates[path] = self._estimate_predictor_bytes(image)
+        self._pending_estimates[image_id] = self._estimate_predictor_bytes(image)
+        self._predictor_paths[image_id] = source_path
         if timer.isActive():
             timer.stop()
         self._retry_controller.total_scheduled += 1
         timer.start(delay_ms)
 
-    def _retry_predictor(self, path: Path) -> None:
+    def _retry_predictor(self, image_id: uuid.UUID) -> None:
         """Retry a throttled predictor submission after its delay elapses."""
-        entry = self._predictor_retry_entries.pop(self._retry_key(path), None)
+        entry = self._predictor_retry_entries.pop(self._retry_key(image_id), None)
         if entry is None:
             return
         timer = entry.timer
         if timer.isActive():
             timer.stop()
         timer.deleteLater()
-        self._pending_estimates[path] = self._estimate_predictor_bytes(entry.image)
+        self._pending_estimates[image_id] = self._estimate_predictor_bytes(entry.image)
+        self._predictor_paths[image_id] = entry.source_path
         self._submit_predictor_job(
-            entry.image, entry.path, attempt=entry.attempts, trap_rejection=True
+            entry.image,
+            entry.image_id,
+            entry.source_path,
+            attempt=entry.attempts,
+            trap_rejection=True,
         )
 
-    def _cancel_predictor_retry(self, path: Path) -> None:
-        """Cancel and dispose of any scheduled retry for path."""
-        entry = self._predictor_retry_entries.pop(self._retry_key(path), None)
+    def _cancel_predictor_retry(self, image_id: uuid.UUID) -> None:
+        """Cancel and dispose of any scheduled retry for image_id."""
+        entry = self._predictor_retry_entries.pop(self._retry_key(image_id), None)
         if entry is None:
             return
-        self._pending_estimates.pop(path, None)
+        self._pending_estimates.pop(image_id, None)
         self._run_on_main_thread(lambda: self._cancel_predictor_timer(entry.timer))
 
     def _cancel_predictor_timer(self, timer: QTimer) -> None:
@@ -615,24 +669,25 @@ class SamManager(QObject):
             return
         while len(self._sam_predictors) > limit:
             try:
-                oldest_path = next(iter(self._sam_predictors))
+                oldest_id = next(iter(self._sam_predictors))
             except StopIteration:  # pragma: no cover - defensive guard
                 break
             logger.info(
                 "Trimming SAM predictor cache entry %s to honor cache_limit=%s",
-                oldest_path,
+                oldest_id,
                 limit,
             )
-            self._drop_predictor(oldest_path)
+            self._drop_predictor(oldest_id)
 
-    def _drop_predictor(self, path: Path) -> bool:
-        """Remove ``path`` from the predictor cache and notify listeners."""
-        predictor = self._sam_predictors.pop(path, None)
+    def _drop_predictor(self, image_id: uuid.UUID) -> bool:
+        """Remove ``image_id`` from the predictor cache and notify listeners."""
+        predictor = self._sam_predictors.pop(image_id, None)
         if predictor is None:
             return False
-        self._predictor_sizes.pop(path, None)
-        self._pending_estimates.pop(path, None)
-        self.predictorRemoved.emit(path)
+        self._predictor_sizes.pop(image_id, None)
+        self._predictor_paths.pop(image_id, None)
+        self._pending_estimates.pop(image_id, None)
+        self.predictorRemoved.emit(image_id)
         return True
 
     @staticmethod

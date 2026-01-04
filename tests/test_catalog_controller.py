@@ -47,15 +47,17 @@ def test_remove_images_by_id_batches_evictions_and_display(monkeypatch, qpane_vi
         "_display_current_catalog_image",
         lambda *, fit_view=True: display_calls.append(fit_view),
     )
-    evictions: list[tuple[Path, ...]] = []
+    evictions: list[tuple[uuid.UUID, ...]] = []
     monkeypatch.setattr(
-        controller, "_evict_paths", lambda paths: evictions.append(tuple(paths))
+        controller,
+        "_evict_images",
+        lambda image_ids: evictions.append(tuple(image_ids)),
     )
     removed = controller.removeImagesByID([second, first, second])
     assert removed == (second, first)
     assert display_calls == [True]
     assert len(evictions) == 1
-    assert set(evictions[0]) == {Path("a.png"), Path("b.png")}
+    assert set(evictions[0]) == {first, second}
     assert controller.catalog.getImageIds() == [third]
 
 

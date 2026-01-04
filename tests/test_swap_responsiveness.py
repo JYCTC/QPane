@@ -220,7 +220,7 @@ def test_swap_responsiveness_under_contention(
     )
     mask_prefetch_calls: list[tuple[uuid.UUID | None, str, bool]] = []
     mask_cancelled: list[uuid.UUID | None] = []
-    predictor_cancelled: list[Path] = []
+    predictor_cancelled: list[uuid.UUID] = []
     original_prefetch = mask_service.prefetchColorizedMasks
 
     def _recording_prefetch(
@@ -252,10 +252,10 @@ def test_swap_responsiveness_under_contention(
     )
     original_cancel_predictor = sam_manager.cancelPendingPredictor
 
-    def _recording_predictor_cancel(self: SamManager, path: Path) -> bool:
+    def _recording_predictor_cancel(self: SamManager, image_id: uuid.UUID) -> bool:
         """Log predictor cancellations for assertions while cancelling as usual."""
-        predictor_cancelled.append(path)
-        return original_cancel_predictor(path)
+        predictor_cancelled.append(image_id)
+        return original_cancel_predictor(image_id)
 
     sam_manager.cancelPendingPredictor = MethodType(
         _recording_predictor_cancel,

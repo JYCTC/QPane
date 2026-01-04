@@ -113,11 +113,11 @@ class CatalogController:
             Evicts tile/SAM caches for removed or changed paths and optionally
             triggers rendering of the new current image.
         """
-        removed_paths, changed_paths = self.catalog.setImagesByID(image_map, current_id)
-        if removed_paths:
-            self._evict_paths(removed_paths)
-        if changed_paths:
-            self._evict_paths(changed_paths)
+        removed_ids, changed_ids = self.catalog.setImagesByID(image_map, current_id)
+        if removed_ids:
+            self._evict_images(removed_ids)
+        if changed_ids:
+            self._evict_images(changed_ids)
         if display:
             self._display_current_catalog_image()
 
@@ -139,17 +139,10 @@ class CatalogController:
         if image.isNull():
             logger.error("addImage called with null QImage for %s", image_id)
             raise ValueError("image must not be null")
-        old_path = self.catalog.getPath(image_id)
         old_image = self.catalog.getImage(image_id)
         self.catalog.addImage(image_id, image, path)
-        if path is not None and old_path == path and images_differ(old_image, image):
-            self._evict_paths((path,))
-        if (
-            old_path is not None
-            and old_path != path
-            and old_path not in self.catalog.getAllPaths()
-        ):
-            self._evict_paths((old_path,))
+        if images_differ(old_image, image):
+            self._evict_images((image_id,))
 
     def removeImageByID(self, image_id: uuid.UUID) -> None:
         """Remove a single image and clean up dependent caches.
@@ -516,6 +509,7 @@ class CatalogController:
         self._swap_delegate.apply_image(
             self._qpane.original_image,
             source_path=policy.source,
+            image_id=None,
             fit_view=fit_view,
         )
         self._apply_placeholder_view_policy(placeholder, policy)
@@ -751,19 +745,17 @@ class CatalogController:
         self._viewport.zoom_mode = ViewportZoomMode.CUSTOM
         self._viewport.setZoomAndPan(zoom, QPointF(pan_x, pan_y))
 
-    def _evict_paths(self, paths: Iterable[Path | None]) -> None:
-        """Purge tile and SAM caches for the provided file paths.
+    def _evict_images(self, image_ids: Iterable[uuid.UUID]) -> None:
+        """Purge tile and SAM caches for the provided image IDs.
 
         Args:
-            paths: Paths to drop from tile and SAM caches.
+            image_ids: IDs to drop from tile and SAM caches.
         """
         sam_manager = self._sam_manager
-        for path in paths:
-            if path is None:
-                continue
-            self._tile_manager.remove_tiles_for_path(path)
+        for image_id in image_ids:
+            self._tile_manager.remove_tiles_for_image_id(image_id)
             if sam_manager is not None:
-                sam_manager.removeFromCache(path)
+                sam_manager.removeFromCache(image_id)
 
     def _remove_images(
         self, image_ids: Iterable[uuid.UUID], *, log_context: str
@@ -771,23 +763,21 @@ class CatalogController:
         """Remove provided images and coordinate cache/link cleanup."""
         ordered_ids = tuple(dict.fromkeys(image_ids))
         removed: list[uuid.UUID] = []
-        paths_to_evict: set[Path] = set()
+        ids_to_evict: set[uuid.UUID] = set()
         mask_service = self._mask_service
         for image_id in ordered_ids:
             if not self.catalog.containsImage(image_id):
                 continue
             removed.append(image_id)
-            path = self.catalog.getPath(image_id)
-            if path:
-                paths_to_evict.add(path)
+            ids_to_evict.add(image_id)
             if mask_service is not None:
                 mask_service.invalidateMaskCachesForImage(image_id)
             self.catalog.removeImageByID(image_id)
             self.link_manager.handleImageRemoved(image_id)
         if not removed:
             return tuple()
-        if paths_to_evict:
-            self._evict_paths(paths_to_evict)
+        if ids_to_evict:
+            self._evict_images(ids_to_evict)
         if not self.catalog.hasImages():
             logger.info(
                 "Catalog empty after %s; clearing images and using placeholder",

@@ -19,6 +19,7 @@
 from __future__ import annotations
 import threading
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -98,24 +99,31 @@ def test_concurrency_managers_operate_cleanly(tmp_path, monkeypatch, qapp) -> No
     checkpoint_path.write_bytes(b"checkpoint")
     sam_manager = SamManager(executor=executor, checkpoint_path=checkpoint_path)
     full_image = _make_image()
+    image_id = uuid.uuid4()
     source_path = Path(tmp_path / "sample.png")
-    tile_identifier = TileIdentifier(source_path, 1.0, 0, 0)
+    tile_identifier = TileIdentifier(
+        image_id=image_id,
+        source_path=source_path,
+        pyramid_scale=1.0,
+        row=0,
+        col=0,
+    )
     mask_path = tmp_path / "mask.png"
     predictors: list = []
     sam_manager.predictorReady.connect(
-        lambda predictor, path: predictors.append((predictor, path))
+        lambda predictor, predictor_id: predictors.append((predictor, predictor_id))
     )
-    pyramid_manager.generate_pyramid_for_image(full_image, source_path)
+    pyramid_manager.generate_pyramid_for_image(image_id, full_image, source_path)
     tile_manager.get_tile(tile_identifier, full_image)
     autosave_manager.saveMaskToPath("mask-1", str(mask_path))
-    sam_manager.requestPredictor(full_image, source_path)
+    sam_manager.requestPredictor(full_image, image_id, source_path=source_path)
     _wait_for_executor_drain(executor, qapp)
     qapp.processEvents()
     assert pyramid_manager.cache_usage_bytes > 0
     assert tile_events and tile_events[-1] == tile_identifier
     assert not tile_manager._worker_state
     assert mask_path.exists()
-    assert predictors and predictors[-1][1] == source_path
+    assert predictors and predictors[-1][1] == image_id
     snapshot = executor.snapshot()
     assert snapshot.active_total == 0
     assert snapshot.pending_total == 0

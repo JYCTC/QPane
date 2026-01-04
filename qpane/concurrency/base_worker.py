@@ -23,6 +23,11 @@ from typing import Any, Callable
 
 from PySide6.QtCore import Qt
 
+try:  # pragma: no cover - dependency availability checked at runtime
+    import shiboken6
+except ImportError:  # pragma: no cover - defensive guard for alternate runtimes
+    shiboken6 = None
+
 from .executor import TaskExecutorProtocol, TaskHandle, TaskOutcome
 
 logger = logging.getLogger(__name__)
@@ -110,10 +115,25 @@ class BaseWorker:
                     name,
                 )
             return
+        if shiboken6 is not None:
+            owner = getattr(signal, "instance", None)
+            if callable(owner):
+                try:
+                    owner = owner()
+                except Exception:
+                    owner = None
+            if owner is None:
+                owner = getattr(signal, "__self__", None)
+            if owner is not None and not shiboken6.isValid(owner):
+                return
         filtered_args = [arg for arg in args if arg is not None]
         if len(filtered_args) == 1 and isinstance(filtered_args[0], (tuple, list)):
             filtered_args = list(filtered_args[0])
         try:
             signal.emit(*filtered_args)
+        except RuntimeError as exc:  # pragma: no cover - Qt raises on deleted QObject
+            if "Signal source has been deleted" in str(exc):
+                return
+            self.logger.exception("Failed to emit %s with args %s", name, filtered_args)
         except Exception:  # pragma: no cover - Qt will raise if signatures mismatch
             self.logger.exception("Failed to emit %s with args %s", name, filtered_args)

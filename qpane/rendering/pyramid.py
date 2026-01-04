@@ -17,6 +17,7 @@
 """Generate and cache image pyramids on executor-backed workers while keeping UI work responsive."""
 
 import logging
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -60,8 +61,8 @@ class PyramidStatus(str, Enum):
 class PyramidWorkerSignals(QObject):
     """Defines signals available from a running worker thread."""
 
-    finished = Signal(Path)  # Emits the source_path when generation is done
-    error = Signal(Path, str)  # Emits path and error message on failure
+    finished = Signal(uuid.UUID)  # Emits the image id when generation is done
+    error = Signal(uuid.UUID, str)  # Emits image id and error message on failure
 
 
 class PyramidGeneratorWorker(QRunnable, BaseWorker):
@@ -84,7 +85,7 @@ class PyramidGeneratorWorker(QRunnable, BaseWorker):
             self.pyramid.status = PyramidStatus.GENERATING
             self.logger.info(
                 "Generating pyramid for %s",
-                self.pyramid.source_path,
+                self.pyramid.source_path or self.pyramid.image_id,
             )
             source_qimage = self.pyramid.full_resolution_image
             # Ensure image is in a 4-channel format to preserve transparency.
@@ -119,12 +120,12 @@ class PyramidGeneratorWorker(QRunnable, BaseWorker):
                 total_size += level_image.sizeInBytes()
             self.pyramid.size_bytes = total_size
             self.pyramid.status = PyramidStatus.COMPLETE
-            self.emit_finished(True, payload=self.pyramid.source_path)
+            self.emit_finished(True, payload=self.pyramid.image_id)
         except Exception as exc:
             self.pyramid.status = PyramidStatus.FAILED
             self.emit_finished(
                 False,
-                payload=(self.pyramid.source_path, str(exc)),
+                payload=(self.pyramid.image_id, str(exc)),
                 error=exc,
             )
 
@@ -138,11 +139,12 @@ class PyramidGeneratorWorker(QRunnable, BaseWorker):
             return
         self.pyramid.status = PyramidStatus.CANCELLED
         self.logger.info(
-            "Cancelled pyramid generation for %s", self.pyramid.source_path
+            "Cancelled pyramid generation for %s",
+            self.pyramid.source_path or self.pyramid.image_id,
         )
         self.emit_finished(
             False,
-            payload=(self.pyramid.source_path, "cancelled"),
+            payload=(self.pyramid.image_id, "cancelled"),
         )
 
 
@@ -153,7 +155,8 @@ class ImagePyramid:
     PyramidManager mutates status and levels on the main thread while workers populate levels in the background.
     """
 
-    source_path: Path
+    image_id: uuid.UUID
+    source_path: Path | None
     full_resolution_image: QImage
     levels: Dict[float, QImage] = field(default_factory=dict)
     status: PyramidStatus = PyramidStatus.PENDING
@@ -166,8 +169,8 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
     Generates pyramids on the shared executor, enforces byte budgets with LRU eviction, and keeps mutations on the Qt main thread. Retry scheduling relies on the shared controller's main-thread dispatch. Callers treat returned ImagePyramids as read-only snapshots.
     """
 
-    pyramidReady = Signal(Path)
-    pyramidThrottled = Signal(Path, int)
+    pyramidReady = Signal(uuid.UUID)
+    pyramidThrottled = Signal(uuid.UUID, int)
 
     def __init__(
         self,
@@ -188,17 +191,17 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         self._config = config
         self._executor: TaskExecutorProtocol | None = executor
         self._owns_executor = bool(owns_executor)
-        self._pyramids: Dict[Path, ImagePyramid] = {}
-        self._cache: OrderedDict[Path, ImagePyramid] = OrderedDict()
+        self._pyramids: Dict[uuid.UUID, ImagePyramid] = {}
+        self._cache: OrderedDict[uuid.UUID, ImagePyramid] = OrderedDict()
         self.cache_limit_bytes = self._resolve_cache_limit_bytes(config)
         self._cache_admission_guard = None
         self._managed_mode = False
-        self._rejected_cache_keys: set[Path] = set()
+        self._rejected_cache_keys: set[uuid.UUID] = set()
         self._cache_size_bytes: int = 0
-        self._active_workers: Dict[Path, PyramidGeneratorWorker] = {}
-        self._active_handles: Dict[Path, TaskHandle] = {}
+        self._active_workers: Dict[uuid.UUID, PyramidGeneratorWorker] = {}
+        self._active_handles: Dict[uuid.UUID, TaskHandle] = {}
         dispatcher = qt_retry_dispatcher(self._executor, category="pyramid_main")
-        self._pyramid_retry: RetryController[Path, ImagePyramid] = (
+        self._pyramid_retry: RetryController[uuid.UUID, ImagePyramid] = (
             makeQtRetryController(
                 "pyramid",
                 _PYRAMID_RETRY_BASE_MS,
@@ -236,77 +239,76 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         """Tag the next eviction batch with an external ``reason``."""
         self._next_eviction_reason = reason
 
-    def pyramid_for_path(self, source_path: Path) -> "ImagePyramid | None":
-        """Return the ImagePyramid for a given path, or None if not present."""
+    def pyramid_for_image_id(self, image_id: uuid.UUID) -> "ImagePyramid | None":
+        """Return the ImagePyramid for a given image ID, or None if not present."""
         self._assert_main_thread()
-        return self._pyramids.get(source_path)
+        return self._pyramids.get(image_id)
 
-    def iter_cached_paths(self):
-        """Yield cached image paths in LRU order (oldest first)."""
+    def iter_cached_ids(self):
+        """Yield cached image IDs in LRU order (oldest first)."""
         self._assert_main_thread()
         return iter(self._cache.keys())
 
-    def pending_paths(self):
-        """Return paths that still have generation in progress."""
+    def pending_ids(self):
+        """Return image IDs that still have generation in progress."""
         self._assert_main_thread()
         return set(self._active_workers.keys())
 
     def prefetch_pyramid(
         self,
+        image_id: uuid.UUID,
         image: QImage,
-        source_path: Path,
+        source_path: Path | None,
         *,
         reason: str = "prefetch",
     ) -> bool:
-        """Request background pyramid generation for `source_path` if needed."""
+        """Request background pyramid generation for `image_id` if needed."""
         self._assert_main_thread()
-        if source_path is None:
-            raise ValueError("source_path is required")
+        if not isinstance(image_id, uuid.UUID):
+            raise ValueError("image_id is required")
         if image.isNull():
             return False
-        if self._prefetch_pending(source_path):
-            logger.debug("Pyramid prefetch already pending for %s", source_path)
+        if self._prefetch_pending(image_id):
+            logger.debug("Pyramid prefetch already pending for %s", image_id)
             return False
-        pyramid = self._pyramids.get(source_path)
+        pyramid = self._pyramids.get(image_id)
         if pyramid is not None and pyramid.status == PyramidStatus.COMPLETE:
             self._prefetch_skip_hit()
             return False
-        if source_path in self._active_handles:
-            logger.debug("Pyramid generation already active for %s", source_path)
+        if image_id in self._active_handles:
+            logger.debug("Pyramid generation already active for %s", image_id)
             return False
-        self._prefetch_begin(source_path, record_start=False)
+        self._prefetch_begin(image_id, record_start=False)
         try:
-            self.generate_pyramid_for_image(image, source_path)
+            self.generate_pyramid_for_image(image_id, image, source_path)
         except Exception:
-            self._prefetch_finish(source_path, success=False)
+            self._prefetch_finish(image_id, success=False)
             logger.exception(
-                "Pyramid prefetch submission failed (path=%s)", source_path
+                "Pyramid prefetch submission failed (image_id=%s)", image_id
             )
             raise
-        logger.info(
-            "Scheduled pyramid prefetch for %s (reason=%s)", source_path, reason
-        )
+        logger.info("Scheduled pyramid prefetch for %s (reason=%s)", image_id, reason)
         return True
 
     def cancel_prefetch(
         self,
-        paths: Sequence[Path],
+        image_ids: Sequence[uuid.UUID],
         *,
         reason: str = "navigation",
-    ) -> list[Path]:
+    ) -> list[uuid.UUID]:
         """Cancel outstanding pyramid prefetch requests."""
-        if not paths:
+        if not image_ids:
             return []
         self._assert_main_thread()
-        cancelled: list[Path] = []
+        cancelled: list[uuid.UUID] = []
         executor = self._executor
         if executor is None:
             raise RuntimeError("PyramidManager executor is missing")
-        for path in paths:
-            if not self._prefetch_pending(path):
+        for image_id in image_ids:
+            if not self._prefetch_pending(image_id):
                 continue
-            handle = self._active_handles.get(path)
-            worker = self._active_workers.get(path)
+            handle = self._active_handles.get(image_id)
+            worker = self._active_workers.get(image_id)
             cancelled_flag = False
             if executor is not None and handle is not None:
                 try:
@@ -318,42 +320,49 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
                     worker.cancel()
                 except Exception:  # pragma: no cover - defensive guard
                     logger.exception(
-                        "Pyramid worker cancel threw (path=%s, reason=%s)",
-                        path,
+                        "Pyramid worker cancel threw (image_id=%s, reason=%s)",
+                        image_id,
                         reason,
                     )
-            self._detach_worker(path)
-            self._cancel_pyramid_retry(path)
-            self._prefetch_finish(path, success=False)
-            cancelled.append(path)
+            self._detach_worker(image_id)
+            self._cancel_pyramid_retry(image_id)
+            self._prefetch_finish(image_id, success=False)
+            cancelled.append(image_id)
             logger.info(
                 "Cancelled pyramid prefetch %s (reason=%s, executor_cancelled=%s)",
-                path,
+                image_id,
                 reason,
                 cancelled_flag,
             )
         return cancelled
 
-    def generate_pyramid_for_image(self, image: QImage, source_path: Path):
-        """Start a worker to generate a pyramid for ``source_path``."""
+    def generate_pyramid_for_image(
+        self,
+        image_id: uuid.UUID,
+        image: QImage,
+        source_path: Path | None,
+    ):
+        """Start a worker to generate a pyramid for ``image_id``."""
         self._assert_main_thread()
-        if source_path is None:
-            raise ValueError("source_path is required")
-        existing = self._pyramids.get(source_path)
+        if not isinstance(image_id, uuid.UUID):
+            raise ValueError("image_id is required")
+        existing = self._pyramids.get(image_id)
         if existing is None:
             pyramid = ImagePyramid(
+                image_id=image_id,
                 source_path=source_path,
                 full_resolution_image=image,
             )
-            self._pyramids[source_path] = pyramid
+            self._pyramids[image_id] = pyramid
         else:
             pyramid = existing
             pyramid.full_resolution_image = image
+            pyramid.source_path = source_path
 
         def _submit(pyr: ImagePyramid, attempt: int):
             """Submit ``pyr`` to the executor unless it already has an active worker."""
             # Avoid duplicate submission when already active
-            handle = self._active_handles.get(pyr.source_path)
+            handle = self._active_handles.get(pyr.image_id)
             if handle is not None:
                 return handle
             worker = PyramidGeneratorWorker(pyr, self._config)
@@ -369,10 +378,10 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
             if executor is None:
                 raise RuntimeError("PyramidManager executor is missing")
             handle = executor.submit(worker, category="pyramid")
-            self._active_workers[pyr.source_path] = worker
-            self._active_handles[pyr.source_path] = handle
-            self._prefetch_mark_started(pyr.source_path)
-            logger.info("Queued pyramid generation for %s", pyr.source_path)
+            self._active_workers[pyr.image_id] = worker
+            self._active_handles[pyr.image_id] = handle
+            self._prefetch_mark_started(pyr.image_id)
+            logger.info("Queued pyramid generation for %s", pyr.image_id)
             return handle
 
         def _coalesce(old: ImagePyramid, new: ImagePyramid) -> ImagePyramid:
@@ -380,84 +389,84 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
             old.full_resolution_image = new.full_resolution_image
             return old
 
-        def _throttle(path: Path, next_attempt: int, rej: TaskRejected):
+        def _throttle(image_key: uuid.UUID, next_attempt: int, rej: TaskRejected):
             """Record throttling metadata and emit the public signal."""
             logger.warning(
                 "Pyramid generation for %s throttled: pending %s limit=%s "
                 "(total=%s, category=%s)",
-                path,
+                image_key,
                 rej.limit_type,
                 rej.limit_value,
                 rej.pending_total,
                 rej.pending_category,
             )
-            self.pyramidThrottled.emit(path, next_attempt)
+            self.pyramidThrottled.emit(image_key, next_attempt)
 
         self._queue_pyramid_retry(
-            source_path,
+            image_id,
             pyramid,
             submit=_submit,
             throttle=_throttle,
             coalesce=_coalesce,
         )
 
-    def _on_pyramid_generated(self, source_path: Path):
+    def _on_pyramid_generated(self, image_id: uuid.UUID):
         """Slot for when a pyramid worker successfully finishes."""
         self._assert_main_thread()
-        self._detach_worker(source_path)
-        self._pyramid_retry.onSuccess(source_path)
-        self._prefetch_finish(source_path, success=True)
-        if source_path in self._pyramids:
-            pyramid = self._pyramids[source_path]
+        self._detach_worker(image_id)
+        self._pyramid_retry.onSuccess(image_id)
+        self._prefetch_finish(image_id, success=True)
+        if image_id in self._pyramids:
+            pyramid = self._pyramids[image_id]
             if pyramid.status == PyramidStatus.COMPLETE:
-                if self._allow_cache_insert(pyramid.size_bytes, source_path):
-                    self._cache[source_path] = pyramid
+                if self._allow_cache_insert(pyramid.size_bytes, image_id):
+                    self._cache[image_id] = pyramid
                     self._cache_size_bytes += pyramid.size_bytes
                     if not self._managed_mode:
                         self._enforce_cache_size()
-                    logger.info("Pyramid generated for %s", source_path)
-                self.pyramidReady.emit(source_path)
+                    logger.info("Pyramid generated for %s", image_id)
+                self.pyramidReady.emit(image_id)
             elif pyramid.status == PyramidStatus.CANCELLED:
                 logger.info(
                     "Skipped cache promotion for cancelled pyramid %s",
-                    source_path,
+                    image_id,
                 )
             else:
                 logger.warning(
                     "Unexpected pyramid status %s for %s during completion",
                     pyramid.status,
-                    source_path,
+                    image_id,
                 )
 
-    def _on_pyramid_error(self, source_path: Path, error_message: str):
+    def _on_pyramid_error(self, image_id: uuid.UUID, error_message: str):
         """Slot for when a pyramid worker encounters an error."""
         self._assert_main_thread()
-        self._detach_worker(source_path)
-        self._pyramid_retry.onFailure(source_path)
-        self._prefetch_finish(source_path, success=False)
-        pyramid = self._pyramids.get(source_path)
+        self._detach_worker(image_id)
+        self._pyramid_retry.onFailure(image_id)
+        self._prefetch_finish(image_id, success=False)
+        pyramid = self._pyramids.get(image_id)
         if pyramid and pyramid.status != PyramidStatus.CANCELLED:
             pyramid.status = PyramidStatus.FAILED
         if error_message == "cancelled":
-            logger.info("Pyramid generation cancelled for %s", source_path)
+            logger.info("Pyramid generation cancelled for %s", image_id)
             return
         logger.error(
             "Pyramid generation failed for %s: %s",
-            source_path,
+            image_id,
             error_message,
         )
 
     def get_best_fit_image(
-        self, source_path: Path, target_width: float
+        self, image_id: uuid.UUID, target_width: float
     ) -> QImage | None:
         """Return the pyramid level closest to the target width without upscaling.
 
         Falls back to the full-resolution image when no pyramid exists, generation failed or was cancelled, the target width is invalid, or the pyramid is incomplete or would upscale.
         """
         self._assert_main_thread()
-        if source_path is None:
+        if image_id is None:
             return None
-        pyramid = self.pyramid_for_path(source_path)
+        pyramid = self.pyramid_for_image_id(image_id)
         if pyramid is None:
             self._cache_misses += 1
             return None
@@ -488,22 +497,22 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         self._cache_misses += 1
         return original_image
 
-    def remove_pyramid(self, source_path: Path) -> None:
-        """Purge the pyramid, cache state, and worker bookkeeping for ``source_path``."""
+    def remove_pyramid(self, image_id: uuid.UUID) -> None:
+        """Purge the pyramid, cache state, and worker bookkeeping for ``image_id``."""
         self._assert_main_thread()
-        if source_path is None:
-            raise ValueError("source_path is required")
-        was_cached = source_path in self._cache
-        had_worker = source_path in self._active_workers
-        self._drop_cache_entry(source_path)
-        self._cancel_pyramid_retry(source_path)
-        self._pyramids.pop(source_path, None)
-        self._active_handles.pop(source_path, None)
-        self._active_workers.pop(source_path, None)
-        self._prefetch_drop(source_path)
+        if not isinstance(image_id, uuid.UUID):
+            raise ValueError("image_id is required")
+        was_cached = image_id in self._cache
+        had_worker = image_id in self._active_workers
+        self._drop_cache_entry(image_id)
+        self._cancel_pyramid_retry(image_id)
+        self._pyramids.pop(image_id, None)
+        self._active_handles.pop(image_id, None)
+        self._active_workers.pop(image_id, None)
+        self._prefetch_drop(image_id)
         logger.info(
             "Removed pyramid state for %s (cached=%s, worker=%s)",
-            source_path,
+            image_id,
             was_cached,
             had_worker,
         )
@@ -542,19 +551,19 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         """Expose the retry controller snapshot for diagnostics consumers."""
         return self._pyramid_retry.snapshot()
 
-    def pending_retry_paths(self) -> list[Path]:
-        """Return source paths currently queued for retry."""
+    def pending_retry_paths(self) -> list[uuid.UUID]:
+        """Return image IDs currently queued for retry."""
         return list(self._pyramid_retry.pendingKeys())
 
-    def _drop_cache_entry(self, source_path: Path) -> None:
+    def _drop_cache_entry(self, image_id: uuid.UUID) -> None:
         """Remove a pyramid from the LRU cache and update size accounting."""
         self._assert_main_thread()
-        if source_path in self._cache:
-            self._cache_size_bytes -= self._cache[source_path].size_bytes
-            del self._cache[source_path]
+        if image_id in self._cache:
+            self._cache_size_bytes -= self._cache[image_id].size_bytes
+            del self._cache[image_id]
             assert self._cache_size_bytes >= 0, "Cache size went negative"
 
-    def _allow_cache_insert(self, size_bytes: int, key: Path) -> bool:
+    def _allow_cache_insert(self, size_bytes: int, key: uuid.UUID) -> bool:
         """Return True when ``size_bytes`` is within pyramid guardrails."""
         size = max(0, int(size_bytes))
         budget_limit = max(0, int(self.cache_limit_bytes))
@@ -582,27 +591,27 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
 
     def _queue_pyramid_retry(
         self,
-        source_path: Path,
+        image_id: uuid.UUID,
         pyramid: "ImagePyramid",
         *,
         submit: Callable[["ImagePyramid", int], TaskHandle],
-        throttle: Callable[[Path, int, TaskRejected], None],
+        throttle: Callable[[uuid.UUID, int, TaskRejected], None],
         coalesce: (
             Callable[["ImagePyramid", "ImagePyramid"], "ImagePyramid"] | None
         ) = None,
     ) -> None:
         """Queue pyramid generation work through the retry controller."""
         self._pyramid_retry.queueOrCoalesce(
-            source_path,
+            image_id,
             pyramid,
             submit=submit,
             throttle=throttle,
             coalesce=coalesce,
         )
 
-    def _cancel_pyramid_retry(self, source_path: Path) -> None:
-        """Cancel any pending retry for ``source_path``."""
-        self._pyramid_retry.cancel(source_path)
+    def _cancel_pyramid_retry(self, image_id: uuid.UUID) -> None:
+        """Cancel any pending retry for ``image_id``."""
+        self._pyramid_retry.cancel(image_id)
 
     def _cancel_all_pyramid_retries(self) -> None:
         """Cancel every queued pyramid retry."""
@@ -635,18 +644,18 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
             and self._cache
             and evicted < _PYRAMID_EVICTION_BATCH
         ):
-            lru_path = next(iter(self._cache))
+            lru_id = next(iter(self._cache))
             removed_bytes = 0
-            pyramid = self._cache.get(lru_path)
+            pyramid = self._cache.get(lru_id)
             if pyramid is not None:
                 removed_bytes = pyramid.size_bytes
-            self._drop_cache_entry(lru_path)
-            if lru_path in self._pyramids:
-                del self._pyramids[lru_path]
+            self._drop_cache_entry(lru_id)
+            if lru_id in self._pyramids:
+                del self._pyramids[lru_id]
             if removed_bytes:
                 bytes_freed += removed_bytes
                 self._evicted_bytes += removed_bytes
-            evicted_paths.append(str(lru_path))
+            evicted_paths.append(str(lru_id))
             self._evictions_total += 1
             self._record_eviction_metadata(reason)
             evicted += 1
@@ -679,18 +688,18 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         if not self._active_handles:
             self._maybe_wait_for_executor(wait)
             return
-        for source_path, handle in list(self._active_handles.items()):
+        for image_id, handle in list(self._active_handles.items()):
             executor = self._executor
             if executor is None:
                 raise RuntimeError("PyramidManager executor is missing")
             cancelled = executor.cancel(handle)
             if not cancelled:
-                worker = self._active_workers.get(source_path)
+                worker = self._active_workers.get(image_id)
                 if worker is not None:
                     worker.cancel()
             logger.info(
                 "Requested cancellation for pyramid %s (cancelled=%s)",
-                source_path,
+                image_id,
                 cancelled,
             )
         self._active_handles.clear()
@@ -698,10 +707,10 @@ class PyramidManager(QObject, CacheMetricsMixin, ExecutorOwnerMixin):
         self._prefetch_drop_all()
         self._maybe_wait_for_executor(wait)
 
-    def _detach_worker(self, source_path: Path) -> None:
+    def _detach_worker(self, image_id: uuid.UUID) -> None:
         """Remove bookkeeping for a finished or failed worker."""
-        self._active_workers.pop(source_path, None)
-        self._active_handles.pop(source_path, None)
+        self._active_workers.pop(image_id, None)
+        self._active_handles.pop(image_id, None)
 
     def _assert_main_thread(self):
         """Raise AssertionError if not running on the Qt main thread."""

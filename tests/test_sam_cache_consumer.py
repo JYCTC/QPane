@@ -17,8 +17,8 @@
 """Tests for SAM predictor cache consumer wiring."""
 
 from __future__ import annotations
-from pathlib import Path
 from typing import Callable, List
+import uuid
 import pytest
 from qpane.cache.coordinator import CacheCoordinator
 from qpane.cache.consumers import SamPredictorCacheConsumer
@@ -42,16 +42,16 @@ class _ManagerStub:
     """Minimal manager facade exposing predictor hooks used by the consumer."""
 
     def __init__(self) -> None:
-        self.request_calls: list[tuple[object, Path]] = []
+        self.request_calls: list[tuple[object, uuid.UUID, object]] = []
         self.cache_bytes = 0
         self.pending_bytes = 0
-        self._sam_predictors: dict[Path, object] = {}
+        self._sam_predictors: dict[uuid.UUID, object] = {}
         self.predictorReady = _Signal()
         self.predictorCacheCleared = _Signal()
         self.predictorRemoved = _Signal()
 
-    def requestPredictor(self, image, path: Path) -> None:
-        self.request_calls.append((image, path))
+    def requestPredictor(self, image, image_id: uuid.UUID, *, source_path=None) -> None:
+        self.request_calls.append((image, image_id, source_path))
 
     def cache_usage_bytes(self) -> int:
         return self.cache_bytes
@@ -59,14 +59,14 @@ class _ManagerStub:
     def pendingUsageBytes(self) -> int:
         return self.pending_bytes
 
-    def predictorPaths(self) -> list[Path]:
+    def predictorImageIds(self) -> list[uuid.UUID]:
         return list(self._sam_predictors.keys())
 
-    def cancelPendingPredictor(self, path: Path) -> bool:
+    def cancelPendingPredictor(self, image_id: uuid.UUID) -> bool:
         return False
 
-    def removeFromCache(self, path: Path) -> bool:
-        self._sam_predictors.pop(path, None)
+    def removeFromCache(self, image_id: uuid.UUID) -> bool:
+        self._sam_predictors.pop(image_id, None)
         self.cache_bytes = 0
         return True
 
@@ -83,16 +83,16 @@ def test_predictor_consumer_tracks_pending_and_ready_usage():
     manager = _ManagerStub()
     coordinator = CacheCoordinator(512 * 1024 * 1024)
     consumer = SamPredictorCacheConsumer(manager, coordinator)
-    path = Path("pending.png")
+    image_id = uuid.uuid4()
     manager.pending_bytes = 4096
     manager.cache_bytes = 0
-    manager.requestPredictor(None, path)  # wrapped by consumer
+    manager.requestPredictor(None, image_id, source_path=None)  # wrapped by consumer
     snapshot = coordinator.snapshot()
     assert snapshot["consumers"]["predictors"]["usage_bytes"] == 4096
     manager.pending_bytes = 0
     manager.cache_bytes = 2048
-    manager._sam_predictors[path] = object()
-    manager.predictorReady.emit(object(), path)
+    manager._sam_predictors[image_id] = object()
+    manager.predictorReady.emit(object(), image_id)
     snapshot = coordinator.snapshot()
     assert snapshot["consumers"]["predictors"]["usage_bytes"] == 2048
     consumer._trim_to(0)
