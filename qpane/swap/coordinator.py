@@ -45,13 +45,18 @@ from ..core.config_features import SamConfigSlice, require_sam_config
 
 from ..features import FeatureInstallError
 
-from ..rendering import TileIdentifier, TileManager, Viewport
+from ..rendering import TileIdentifier, Viewport
+from .contracts import (
+    MaskManagerView,
+    MaskPrefetchService,
+    PyramidPrefetchManager,
+    SamPredictorManager,
+    TilePrefetchManager,
+)
 
 
 if TYPE_CHECKING:
-    from ..masks.mask_service import MaskService
     from ..qpane import QPane
-    from ..sam.manager import SamManager
 logger = logging.getLogger(__name__)
 
 PYRAMID_RESUBMIT_COOLDOWN_SEC = 1.0
@@ -80,10 +85,10 @@ class SwapCoordinator:
         qpane: QPane,
         catalog: ImageCatalog,
         viewport: Viewport,
-        tile_manager: TileManager,
+        tile_manager: TilePrefetchManager,
         prefetch_settings: PrefetchSettings | None = None,
-        mask_service: MaskService | None = None,
-        sam_manager: SamManager | None = None,
+        mask_service: MaskPrefetchService | None = None,
+        sam_manager: SamPredictorManager | None = None,
     ) -> None:
         """Wire collaborators needed to manage swaps and their background work.
 
@@ -103,9 +108,11 @@ class SwapCoordinator:
         self._qpane = qpane
         self._catalog = catalog
         self._viewport = viewport
-        self._tile_manager = tile_manager
-        self._mask_service = mask_service
-        self._sam_manager = sam_manager
+        if not isinstance(tile_manager, TilePrefetchManager):
+            raise TypeError("tile_manager must implement TilePrefetchManager")
+        self._tile_manager: TilePrefetchManager = tile_manager
+        self._mask_service: MaskPrefetchService | None = None
+        self._sam_manager: SamPredictorManager | None = None
         self._navigation_history: deque[uuid.UUID] = deque(maxlen=16)
         self._pending_mask_prefetch_ids: set[uuid.UUID] = set()
         self._pending_predictor_ids: set[uuid.UUID] = set()
@@ -122,15 +129,21 @@ class SwapCoordinator:
         self._tiles_per_neighbor = 0
         self._diagnostics_missing_logged = False
         self._apply_prefetch_settings(prefetch_settings or PrefetchSettings())
-        if not hasattr(self._tile_manager, "tileReady"):
-            raise AttributeError("Tile manager must expose tileReady signal")
         self._tile_manager.tileReady.connect(self._on_tile_ready)
-        pyramid_manager = getattr(self._catalog, "pyramid_manager", None)
-        if pyramid_manager is None:
-            raise AttributeError("Catalog must expose pyramid_manager")
-        if not hasattr(pyramid_manager, "pyramidReady"):
-            raise AttributeError("Pyramid manager must expose pyramidReady signal")
-        pyramid_manager.pyramidReady.connect(self._on_pyramid_ready)
+        try:
+            pyramid_manager = catalog.pyramid_manager
+        except AttributeError as exc:  # pragma: no cover - defensive guard
+            raise AttributeError("Catalog must expose pyramid_manager") from exc
+        if not isinstance(pyramid_manager, PyramidPrefetchManager):
+            raise TypeError(
+                "catalog.pyramid_manager must implement PyramidPrefetchManager"
+            )
+        self._pyramid_manager: PyramidPrefetchManager = pyramid_manager
+        self._pyramid_manager.pyramidReady.connect(self._on_pyramid_ready)
+        if mask_service is not None:
+            self.on_mask_service_attached(mask_service)
+        if sam_manager is not None:
+            self.on_sam_manager_attached(sam_manager)
 
     def apply_config(self, config: Config | object) -> None:
         """Update prefetch tuning from cache and SAM settings in ``config``."""
@@ -173,12 +186,12 @@ class SwapCoordinator:
         skip_ids = set(neighbor_ids) | {image_id}
         skip_predictor_ids: set[uuid.UUID] = {image_id}
         service = self._mask_service
-        mask_manager = service.manager if service is not None else None
+        mask_manager: MaskManagerView | None = (
+            service.manager if service is not None else None
+        )
         if mask_manager is not None:
             for candidate_id in neighbor_ids:
-                mask_ids = mask_manager.get_mask_ids_for_image(
-                    candidate_id
-                )  # type: ignore[attr-defined]
+                mask_ids = mask_manager.get_mask_ids_for_image(candidate_id)
                 if not mask_ids:
                     continue
                 skip_predictor_ids.add(candidate_id)
@@ -312,8 +325,10 @@ class SwapCoordinator:
         self._maybe_prefetch_tiles(image_id, neighbor_ids)
         self._mark_diagnostics_dirty()
 
-    def on_mask_service_attached(self, service: MaskService) -> None:
+    def on_mask_service_attached(self, service: MaskPrefetchService) -> None:
         """Attach the mask service and refresh neighbor prefetching."""
+        if not isinstance(service, MaskPrefetchService):
+            raise TypeError("mask_service must implement MaskPrefetchService")
         self._mask_service = service
         if self._current_image_id is not None:
             self.prefetch_neighbors(self._current_image_id)
@@ -324,8 +339,10 @@ class SwapCoordinator:
         self._mask_service = None
         self._pending_mask_prefetch_ids.clear()
 
-    def on_sam_manager_attached(self, manager: SamManager) -> None:
+    def on_sam_manager_attached(self, manager: SamPredictorManager) -> None:
         """Attach the SAM manager used for predictor requests and cancellation."""
+        if not isinstance(manager, SamPredictorManager):
+            raise TypeError("sam_manager must implement SamPredictorManager")
         self._sam_manager = manager
 
     def on_sam_manager_detached(self) -> None:
@@ -506,8 +523,6 @@ class SwapCoordinator:
         if service is None:
             self._pending_mask_prefetch_ids = skip_set
             return
-        if not hasattr(service, "cancelPrefetch"):
-            raise AttributeError("Mask service must expose cancelPrefetch")
         self._pending_mask_prefetch_ids = self._cancel_pending_items(
             pending=self._pending_mask_prefetch_ids,
             skip=skip_set,
@@ -528,8 +543,6 @@ class SwapCoordinator:
         if manager is None:
             self._pending_predictor_ids = skip_ids
             return
-        if not hasattr(manager, "cancelPendingPredictor"):
-            raise AttributeError("SAM manager must expose cancelPendingPredictor")
         self._pending_predictor_ids = self._cancel_pending_items(
             pending=self._pending_predictor_ids,
             skip=skip_ids,
@@ -545,11 +558,7 @@ class SwapCoordinator:
         self, *, reason: str, skip: Collection[uuid.UUID] | None = None
     ) -> None:
         """Cancel tracked pyramid prefetches except those in ``skip``."""
-        manager = getattr(self._catalog, "pyramid_manager", None)
-        if manager is None:
-            raise AttributeError("Catalog must expose pyramid_manager")
-        if not hasattr(manager, "cancel_prefetch"):
-            raise AttributeError("Pyramid manager must expose cancel_prefetch")
+        manager = self._pyramid_manager
         skip_ids = set(skip or ())
         if not self._pending_pyramid_ids:
             return
@@ -574,8 +583,6 @@ class SwapCoordinator:
     ) -> None:
         """Cancel tile prefetch jobs whose image IDs are not in ``skip``."""
         manager = self._tile_manager
-        if not hasattr(manager, "cancel_prefetch"):
-            raise AttributeError("Tile manager must expose cancel_prefetch")
         skip_ids = set(skip or ())
         if not self._pending_tile_prefetch_ids:
             return
@@ -720,11 +727,7 @@ class SwapCoordinator:
         """Schedule pyramid prefetch for neighbor candidates with cooldown and depth checks."""
         if not candidates:
             return
-        manager = getattr(self._catalog, "pyramid_manager", None)
-        if manager is None:
-            raise AttributeError("Catalog must expose pyramid_manager")
-        if not hasattr(manager, "prefetch_pyramid"):
-            raise AttributeError("Pyramid manager must expose prefetch_pyramid")
+        manager = self._pyramid_manager
         depth = self._pyramid_prefetch_depth
         if depth == 0:
             return
@@ -785,8 +788,6 @@ class SwapCoordinator:
         if not candidates:
             return
         manager = self._tile_manager
-        if not hasattr(manager, "prefetch_tiles"):
-            raise AttributeError("Tile manager must expose prefetch_tiles")
         depth = self._tile_prefetch_depth
         if depth == 0:
             return

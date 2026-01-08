@@ -177,6 +177,8 @@ class StubPyramidManager:
         self.pyramidReady = DummySignal()
         self.prefetch_calls: list[tuple[uuid.UUID, str]] = []
         self.cancel_calls: list[tuple[tuple[uuid.UUID, ...], str]] = []
+        self.cache_limit_bytes = 0
+        self.cache_usage_bytes = 0
 
     def prefetch_pyramid(
         self,

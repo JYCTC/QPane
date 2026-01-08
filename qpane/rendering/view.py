@@ -177,12 +177,8 @@ class View:
 
     def _connect_rendering_signals(self) -> None:
         """Connect tile/pyramid events directly to the rendering stack."""
-        tile_ready = getattr(self.tile_manager, "tileReady", None)
-        if tile_ready is not None:
-            tile_ready.connect(self.handle_tile_ready)  # type: ignore[attr-defined]
-        pyramid_ready = getattr(self._catalog, "pyramidReady", None)
-        if pyramid_ready is not None:
-            pyramid_ready.connect(self.handle_pyramid_ready)  # type: ignore[attr-defined]
+        self.tile_manager.tileReady.connect(self.handle_tile_ready)
+        self._catalog.pyramidReady.connect(self.handle_pyramid_ready)
 
     def _prefetch_settings_from_config(self, config: Config) -> PrefetchSettings:
         """Return a PrefetchSettings clone from config.cache, enforcing the expected shape."""

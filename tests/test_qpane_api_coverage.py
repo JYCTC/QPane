@@ -192,7 +192,11 @@ def test_mask_delegates_stub(qapp, monkeypatch):
         class MockMaskService:
             def __init__(self):
                 self.calls = []
-                self.manager = None
+                self.manager = type(
+                    "MaskManagerStub",
+                    (),
+                    {"get_mask_ids_for_image": staticmethod(lambda _image_id: tuple())},
+                )()
 
             def setMaskProperties(self, mask_id, color, opacity):
                 self.calls.append(("setMaskProperties", mask_id, color, opacity))
@@ -204,6 +208,16 @@ def test_mask_delegates_stub(qapp, monkeypatch):
 
             def listMasksForImage(self, image_id):
                 return ("mask1",)
+
+            def prefetchColorizedMasks(
+                self,
+                image_id: uuid.UUID,
+                *,
+                reason: str = "navigation",
+                scales=None,
+            ) -> bool:
+                self.calls.append(("prefetchColorizedMasks", image_id, reason))
+                return False
 
             def connectUndoStackChanged(self, slot):
                 pass
@@ -226,8 +240,11 @@ def test_mask_delegates_stub(qapp, monkeypatch):
             def isActivationPending(self, image_id):
                 return False
 
-            def cancelPrefetch(self, reason, skip=None):
-                pass
+            def cancelPrefetch(self, image_id: uuid.UUID | None) -> bool:
+                return False
+
+            def get_latest_status_message(self, *_args, **_kwargs):
+                return None
 
             @property
             def controller(self):

@@ -29,6 +29,7 @@ from PySide6.QtCore import QTimer
 from ..cache import CacheCoordinator
 from ..cache.registry import CacheRegistry
 from ..concurrency.executor import (
+    LiveTunableExecutorProtocol,
     QThreadPoolExecutor,
     TaskExecutorProtocol,
 )
@@ -626,23 +627,10 @@ class QPaneState:
         executor = getattr(self, "_executor", None)
         if executor is None:
             return
-        required_methods = (
-            "setMaxWorkers",
-            "setPendingTotal",
-            "setCategoryPriorities",
-            "setCategoryLimits",
-            "setPendingLimits",
-            "setDeviceLimits",
-        )
-        missing = tuple(
-            method for method in required_methods if not hasattr(executor, method)
-        )
-        if missing:
-            names = ", ".join(missing)
+        if not isinstance(executor, LiveTunableExecutorProtocol):
             logger.debug(
-                "Skipping live concurrency update because executor %s lacks methods: %s",
+                "Skipping live concurrency update because executor %s lacks live tuning",
                 type(executor).__name__,
-                names,
             )
             return
         policy = build_thread_policy(self._base_config)

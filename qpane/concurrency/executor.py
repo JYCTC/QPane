@@ -161,6 +161,29 @@ class TaskExecutorProtocol(Protocol):
         """Stop accepting new work and optionally wait for completion."""
 
 
+@runtime_checkable
+class LiveTunableExecutorProtocol(TaskExecutorProtocol, Protocol):
+    """Executor variant that supports live tuning of concurrency limits."""
+
+    def setMaxWorkers(self, max_workers: int) -> None:
+        """Apply a new maximum worker count without rebuilding the executor."""
+
+    def setPendingTotal(self, max_pending_total: int | None) -> None:
+        """Update the global pending-task budget; ``None`` removes the cap."""
+
+    def setCategoryPriorities(self, priorities: Mapping[str, int]) -> None:
+        """Replace per-category scheduling priorities with ``priorities``."""
+
+    def setCategoryLimits(self, limits: Mapping[str, int]) -> None:
+        """Set per-category concurrency limits to control active task counts."""
+
+    def setPendingLimits(self, limits: Mapping[str, int]) -> None:
+        """Set per-category pending queue limits to cap enqueued tasks."""
+
+    def setDeviceLimits(self, limits: Mapping[str, Mapping[str, int]]) -> None:
+        """Set per-device concurrency limits keyed by device identifier."""
+
+
 @dataclass
 class _TaskEntry:
     """Internal bookkeeping for pending/active tasks."""
