@@ -113,6 +113,11 @@ class CacheCoordinator:
         """Return the configured global soft cap in bytes."""
         return self._active_budget_bytes
 
+    @property
+    def total_usage_bytes(self) -> int:
+        """Return the current aggregate usage across all registered consumers."""
+        return self._total_usage()
+
     def has_consumer(self, consumer_id: str) -> bool:
         """Return True when ``consumer_id`` is registered for coordination."""
         return consumer_id in self._consumers

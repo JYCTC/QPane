@@ -92,7 +92,8 @@ def _seed_mask_service(qpane: QPane) -> None:
 @pytest.fixture
 def qpane_with_sam(monkeypatch, qapp):
     _stub_sam_service(monkeypatch)
-    qpane = QPane(features=("mask", "sam"))
+    executor = StubExecutor()
+    qpane = QPane(features=("mask", "sam"), task_executor=executor)
     qpane.resize(64, 64)
     catalog = qpane.catalog()
     mask_manager = types.SimpleNamespace(
@@ -183,7 +184,8 @@ def test_sam_providers_report_additional_metrics():
 
 def test_install_sam_feature_respects_config(monkeypatch, qapp):
     _stub_sam_service(monkeypatch)
-    qpane = QPane(features=("mask", "sam"))
+    executor = StubExecutor()
+    qpane = QPane(features=("mask", "sam"), task_executor=executor)
     qpane.resize(64, 64)
     _detachSamManager_keep_delegate(qpane)
     qpane.applySettings(sam_device="cuda", sam_cache_limit=1)
@@ -213,7 +215,8 @@ def test_install_sam_feature_disabled_missing_checkpoint(monkeypatch, qapp):
         raise service.SamDependencyError("missing checkpoint")
 
     monkeypatch.setattr(service, "ensure_checkpoint", _raise_missing)
-    qpane = QPane(features=("mask", "sam"))
+    executor = StubExecutor()
+    qpane = QPane(features=("mask", "sam"), task_executor=executor)
     qpane.resize(64, 64)
     _detachSamManager_keep_delegate(qpane)
     qpane.applySettings(sam_download_mode="disabled")

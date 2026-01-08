@@ -477,15 +477,33 @@ class QPaneState:
             self._stop_headroom_monitor()
             fallback_to_hard_cap = True
         else:
-            budget_bytes = cache_settings.resolve_active_budget_bytes(
-                psutil_module=psutil_module
-            )
-            snapshot = self._build_headroom_snapshot(psutil_module)
-            if not snapshot:
+            try:
+                mem = psutil_module.virtual_memory()  # type: ignore[attr-defined]
+                available = int(getattr(mem, "available"))
+                total = int(getattr(mem, "total"))
+            except Exception:
                 self._headroom_psutil_missing = True
                 budget_bytes = 1024 * MB
                 self._stop_headroom_monitor()
                 fallback_to_hard_cap = True
+                snapshot = {}
+            else:
+                headroom_bytes = min(
+                    int(total * max(0.0, float(cache_settings.headroom_percent))),
+                    max(0, int(cache_settings.headroom_cap_mb)) * MB,
+                )
+                usage_bytes = coordinator.total_usage_bytes
+                raw_budget = available + usage_bytes - headroom_bytes
+                capacity_bytes = max(0, total - headroom_bytes)
+                budget_bytes = min(max(0, raw_budget), capacity_bytes)
+                # Ensure the budget never drops below current usage while still honoring capacity.
+                budget_bytes = min(max(budget_bytes, usage_bytes), capacity_bytes)
+                snapshot = self._build_headroom_snapshot(psutil_module)
+                if not snapshot:
+                    self._headroom_psutil_missing = True
+                    budget_bytes = 1024 * MB
+                    self._stop_headroom_monitor()
+                    fallback_to_hard_cap = True
         if fallback_to_hard_cap:
             coordinator.set_hard_cap(True)
             snapshot = {}
