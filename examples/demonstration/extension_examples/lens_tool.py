@@ -14,7 +14,16 @@
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Cursor + overlay lens example that magnifies under the pointer."""
+"""Cursor + overlay lens example that magnifies under the pointer.
+
+NOTE: This file is designed for the QPane Interactive Demo playground.
+It uses standalone functions to allow hot-reloading of logic without
+re-registering the tool class itself.
+
+For a production implementation, prefer the class-based approach
+described in `docs/extensibility.md`, where `draw_overlay` and
+`getCursor` are methods of your `ExtensionTool` subclass.
+"""
 
 from __future__ import annotations
 

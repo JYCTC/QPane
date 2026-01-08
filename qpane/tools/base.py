@@ -70,29 +70,25 @@ class ExtensionTool(abc.ABC):
         """Hook for cleanup when a tool is deactivated; base implementation does nothing."""
         return None
 
-    @abc.abstractmethod
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        """Handle pointer press events forwarded from the QPane widget."""
-        ...
+        """Ignore presses by default so tools opt in explicitly."""
+        event.ignore()
 
-    @abc.abstractmethod
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        """Handle pointer move events forwarded from the QPane widget."""
-        ...
+        """Ignore moves by default; subclasses override to react."""
+        event.ignore()
 
-    @abc.abstractmethod
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        """Handle pointer release events forwarded from the QPane widget."""
-        ...
+        """Ignore releases by default to keep the base inert."""
+        event.ignore()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         """Ignore double-clicks by default; tools opt in when they care."""
         event.ignore()
 
-    @abc.abstractmethod
     def wheelEvent(self, event: QWheelEvent) -> None:
-        """Handle wheel or trackpad gestures forwarded from the QPane widget."""
-        ...
+        """Ignore wheel gestures by default so scrolling stays inert."""
+        event.ignore()
 
     def enterEvent(self, event: QEnterEvent) -> None:
         """Ignore enter events by default so the QPane maintains cursor state."""
@@ -111,7 +107,7 @@ class ExtensionTool(abc.ABC):
         event.ignore()
 
     def draw_overlay(self, painter: QPainter) -> None:
-        """Optional overlay pass; tools override when they need custom art."""
+        """No-op overlay pass; override to draw custom visuals."""
         return None
 
     def getCursor(self) -> QCursor | None:

@@ -342,51 +342,78 @@ class Tools(QObject):
 
     def draw_overlay(self, painter: QPainter) -> None:
         """Delegate overlay drawing to the active tool with fault tolerance."""
-        self._dispatch_tool_event("draw_overlay", painter)
+        tool = self._active_tool
+        if tool is None:
+            return
+        self._invoke_tool("draw_overlay", tool.draw_overlay, painter)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         """Forward wheel events to the active tool."""
-        self._dispatch_tool_event("wheelEvent", event)
+        tool = self._active_tool
+        if tool is None:
+            return
+        self._invoke_tool("wheelEvent", tool.wheelEvent, event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         """Forward mouse press events to the active tool."""
-        self._dispatch_tool_event("mousePressEvent", event)
+        tool = self._active_tool
+        if tool is None:
+            return
+        self._invoke_tool("mousePressEvent", tool.mousePressEvent, event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         """Forward mouse move events to the active tool."""
-        self._dispatch_tool_event("mouseMoveEvent", event)
+        tool = self._active_tool
+        if tool is None:
+            return
+        self._invoke_tool("mouseMoveEvent", tool.mouseMoveEvent, event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         """Forward mouse release events to the active tool."""
-        self._dispatch_tool_event("mouseReleaseEvent", event)
+        tool = self._active_tool
+        if tool is None:
+            return
+        self._invoke_tool("mouseReleaseEvent", tool.mouseReleaseEvent, event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         """Forward mouse double-clicks to the active tool."""
-        self._dispatch_tool_event("mouseDoubleClickEvent", event)
+        tool = self._active_tool
+        if tool is None:
+            return
+        self._invoke_tool("mouseDoubleClickEvent", tool.mouseDoubleClickEvent, event)
 
     def enterEvent(self, event) -> None:
         """Forward enter events to the active tool."""
-        self._dispatch_tool_event("enterEvent", event)
+        tool = self._active_tool
+        if tool is None:
+            return
+        self._invoke_tool("enterEvent", tool.enterEvent, event)
 
     def leaveEvent(self, event) -> None:
         """Forward leave events to the active tool."""
-        self._dispatch_tool_event("leaveEvent", event)
+        tool = self._active_tool
+        if tool is None:
+            return
+        self._invoke_tool("leaveEvent", tool.leaveEvent, event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         """Forward key presses to the active tool."""
-        self._dispatch_tool_event("keyPressEvent", event)
+        tool = self._active_tool
+        if tool is None:
+            return
+        self._invoke_tool("keyPressEvent", tool.keyPressEvent, event)
 
     def keyReleaseEvent(self, event: QKeyEvent) -> None:
         """Forward key releases to the active tool."""
-        self._dispatch_tool_event("keyReleaseEvent", event)
+        tool = self._active_tool
+        if tool is None:
+            return
+        self._invoke_tool("keyReleaseEvent", tool.keyReleaseEvent, event)
 
-    def _dispatch_tool_event(self, method_name: str, *args) -> None:
-        """Forward an event to the active tool and log exceptions to keep QPane responsive."""
-        if not self._active_tool:
-            return
-        handler = getattr(self._active_tool, method_name, None)
-        if handler is None:
-            return
+    def _invoke_tool(
+        self, method_name: str, handler: Callable[..., None], *args
+    ) -> None:
+        """Invoke a tool handler and log failures to keep QPane responsive."""
         try:
             handler(*args)
         except Exception:

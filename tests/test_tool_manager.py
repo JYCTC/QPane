@@ -25,7 +25,7 @@ from PySide6.QtWidgets import QApplication
 
 from qpane.tools.tools import Tools
 from qpane.tools import ToolDependencies
-from qpane.tools.base import BaseTool, CursorTool, PanZoomTool
+from qpane.tools.base import BaseTool, CursorTool, ExtensionTool, PanZoomTool
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:Failed to disconnect.*"),
@@ -58,6 +58,47 @@ class DummyTool(BaseTool):
 
     def wheelEvent(self, event):
         return None
+
+
+class EmptyTool(ExtensionTool):
+    def __init__(self) -> None:
+        super().__init__()
+
+
+def test_extension_tool_defaults_are_inert(qapp):
+    manager = Tools()
+    manager.registerTool("empty", EmptyTool)
+    manager.set_mode("empty", ToolDependencies())
+    tool = manager.get_active_tool()
+    assert isinstance(tool, EmptyTool)
+
+    class DummyEvent:
+        def __init__(self) -> None:
+            self.ignored = False
+
+        def ignore(self) -> None:
+            self.ignored = True
+
+    mouse_event = DummyEvent()
+    wheel_event = DummyEvent()
+    enter_event = DummyEvent()
+    leave_event = DummyEvent()
+
+    manager.mousePressEvent(mouse_event)
+    manager.mouseMoveEvent(DummyEvent())
+    manager.mouseReleaseEvent(DummyEvent())
+    manager.mouseDoubleClickEvent(DummyEvent())
+    manager.wheelEvent(wheel_event)
+    manager.enterEvent(enter_event)
+    manager.leaveEvent(leave_event)
+    manager.keyPressEvent(DummyEvent())
+    manager.keyReleaseEvent(DummyEvent())
+    manager.draw_overlay(object())
+
+    assert mouse_event.ignored is True
+    assert wheel_event.ignored is True
+    assert enter_event.ignored is True
+    assert leave_event.ignored is True
 
 
 def test_tool_manager_register_and_unregister(qapp):

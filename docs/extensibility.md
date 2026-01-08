@@ -81,6 +81,8 @@ Tool entry points live on `ExtensionTool`. Override these to handle input:
 *   **Keyboard:** `ExtensionTool.keyPressEvent`, `ExtensionTool.keyReleaseEvent`
 *   **Rendering:** `ExtensionTool.draw_overlay`, `ExtensionTool.getCursor`
 
+`ExtensionTool` ships with concrete no-op implementations for every handler, so you only need to override the events you care about. Overrides must follow the expected signatures exactly.
+
 ### Tool Signals
 Emit requests through `ExtensionTool.signals` (an `ExtensionToolSignals` instance) to control the viewer:
 
@@ -96,7 +98,7 @@ from PySide6.QtGui import QCursor, QColor
 from qpane import ExtensionTool
 
 # 1. The Tool: Tracks mouse position
-# Must inherit from ExtensionTool and implement abstract event handlers.
+# Inherit from ExtensionTool and override only the events you need.
 class LensTool(ExtensionTool):
     def __init__(self, qpane):
         super().__init__()  # Initialize signal bus
@@ -105,7 +107,7 @@ class LensTool(ExtensionTool):
     def mouseMoveEvent(self, event):
         self.qpane.update()  # Request redraw so the lens follows the mouse
 
-    # Required abstract methods (no-ops for this simple tool)
+    # Optional overrides (base class already provides no-op handlers)
     def mousePressEvent(self, event): pass
     def mouseReleaseEvent(self, event): pass
     def wheelEvent(self, event): pass

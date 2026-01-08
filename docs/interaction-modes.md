@@ -53,6 +53,7 @@ Want to know how deep you are? `QPane.currentZoom` tells you the current multipl
 *   **Persistence:** Modes stick around. If you switch to "Brush" mode and navigate to the next image, you remain in "Brush" mode.
 *   **Overlays:** Switching modes often changes the cursor and may show or hide overlays (like the brush circle).
 *   **Validation:** `setControlMode` safely handles missing features (like trying to use Smart Select without SAM installed) by logging a warning and ignoring the request. However, it raises a `ValueError` if passed an unknown mode ID.
+*   **Event Delivery:** Tools always expose the full Qt event surface via concrete no-op handlers, so dispatch is direct and predictable—override only what you need.
 
 > **Pro Tip:** Want the best of both worlds? QPane includes a built-in "hold Space to pan" feature that temporarily switches to `CONTROL_MODE_PANZOOM` while the widget has focus. For a global implementation that works even when focus is elsewhere (like in the demo), see `examples/demonstration/demo_window.py`.
 

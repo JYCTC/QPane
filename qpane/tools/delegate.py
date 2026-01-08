@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import (
@@ -377,7 +377,7 @@ class ToolInteractionDelegate:
 
     def _forward_tool_event(
         self,
-        method_name: str,
+        handler: Callable[[object], None],
         event,
         *,
         guard_blank: bool = True,
@@ -386,7 +386,7 @@ class ToolInteractionDelegate:
         """Forward Qt events to the active tool while respecting blank/image guards.
 
         Args:
-            method_name: Name of the tool handler on the tools manager.
+            handler: Callable on the tool manager that accepts the event.
             event: Qt event to dispatch.
             guard_blank: Skip dispatch when the QPane is blank.
             guard_image: Skip dispatch when no image is loaded.
@@ -396,39 +396,45 @@ class ToolInteractionDelegate:
             return
         if guard_image and qpane.original_image.isNull():
             return
-        handler = getattr(qpane._tools_manager, method_name, None)
-        if handler is not None:
-            handler(event)
+        handler(event)
 
     def handle_wheel_event(self, event: QWheelEvent) -> None:
         """Forward wheel events to the active tool when content exists."""
-        self._forward_tool_event("wheelEvent", event, guard_image=True)
+        self._forward_tool_event(
+            self._qpane._tools_manager.wheelEvent, event, guard_image=True
+        )
 
     def handle_mouse_press(self, event: QMouseEvent) -> None:
         """Forward mouse press events to the active tool."""
-        self._forward_tool_event("mousePressEvent", event)
+        self._forward_tool_event(self._qpane._tools_manager.mousePressEvent, event)
 
     def handle_mouse_move(self, event: QMouseEvent) -> None:
         """Forward mouse move events to the active tool."""
         self.update_cursor()
-        self._forward_tool_event("mouseMoveEvent", event)
+        self._forward_tool_event(self._qpane._tools_manager.mouseMoveEvent, event)
 
     def handle_mouse_release(self, event: QMouseEvent) -> None:
         """Forward mouse release events to the active tool."""
-        self._forward_tool_event("mouseReleaseEvent", event)
+        self._forward_tool_event(self._qpane._tools_manager.mouseReleaseEvent, event)
 
     def handle_mouse_double_click(self, event: QMouseEvent) -> None:
         """Forward double-click events to the active tool."""
-        self._forward_tool_event("mouseDoubleClickEvent", event)
+        self._forward_tool_event(
+            self._qpane._tools_manager.mouseDoubleClickEvent, event
+        )
 
     def handle_enter_event(self, event) -> None:
         """Notify the active tool that the cursor entered the widget."""
         self.update_cursor()
-        self._forward_tool_event("enterEvent", event, guard_blank=False)
+        self._forward_tool_event(
+            self._qpane._tools_manager.enterEvent, event, guard_blank=False
+        )
 
     def handle_leave_event(self, event) -> None:
         """Notify the active tool that the cursor left the widget."""
-        self._forward_tool_event("leaveEvent", event, guard_blank=False)
+        self._forward_tool_event(
+            self._qpane._tools_manager.leaveEvent, event, guard_blank=False
+        )
 
     def handle_show_event(self) -> None:
         """Ensure pan/zoom is active on first show and force view alignment."""

@@ -32,26 +32,10 @@ def build_custom_cursor_tool(qpane_widget):
             super().__init__()
             self._qpane = qpane_widget
 
-        def mousePressEvent(self, event):  # type: ignore[override]
-            """Ignore presses so the tool remains inert."""
-            event.ignore()
-
-        def mouseMoveEvent(self, event):  # type: ignore[override]
+        def mouseMoveEvent(self, event):
             """Request overlay and cursor refresh so hooks track the pointer."""
             self.signals.repaint_overlay_requested.emit()
             self.signals.cursor_update_requested.emit()
             event.ignore()
-
-        def mouseReleaseEvent(self, event):  # type: ignore[override]
-            """Ignore releases so the tool remains inert."""
-            event.ignore()
-
-        def wheelEvent(self, event):  # type: ignore[override]
-            """Ignore wheel gestures so the tool remains inert."""
-            event.ignore()
-
-        def getCursor(self):  # type: ignore[override]
-            """Defer cursor selection to the registered hook provider."""
-            return None
 
     return CustomCursorTool
