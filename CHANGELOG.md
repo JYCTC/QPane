@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2.1 (2026-01-09)
+
+### Fixes
+- Prevent executor crashes when queued work targets a deleted QThreadPool, dropping late tasks with a warning instead
+
+### Tooling
+- Disable local post-commit semantic-release tagging so CI remains the single source of released tags
+
 ## v1.2.0 (2026-01-09)
 
 ### Features
